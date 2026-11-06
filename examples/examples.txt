@@ -1,0 +1,4 @@
+# Run zone 1 for 120 seconds
+
+netcat 10.0.0.xx
+"ZONE=1 TIME=120"

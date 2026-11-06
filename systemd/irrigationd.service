@@ -1,0 +1,33 @@
+[Unit]
+Description=Irrigation Controller Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/irrigationd
+Restart=on-failure
+RestartSec=5s
+
+# Run as a dedicated system user for safety
+User=irrigation
+Group=irrigation
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelTunables=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# Environment configuration (token + bind address)
+# This file is REQUIRED. Service will fail if missing.
+EnvironmentFile=/etc/default/irrigationd
+
+[Install]
+WantedBy=multi-user.target
