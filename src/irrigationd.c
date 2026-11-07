@@ -12,6 +12,8 @@
 #include <time.h>                                                                  // Sleep handling
 #include <sys/time.h>                                                              // struct timeval for timeouts
 #include <stdarg.h>                                                                // Variadic functions
+#include <stdint.h>                                                                // int64_t for millisecond clocks
+#include <signal.h>                                                                // SIGTERM/SIGINT/SIGPIPE handling
 
 #include "mcp23017.h"                                                              // MCP23017 driver interface
 
@@ -35,10 +37,10 @@
 
 #define SERVER_PORT     4242                                                       // TCP port to listen on
 #define CMD_BUF_SZ      256                                                        // Max command length in bytes
-#define MAX_WORKERS     32                                                         // Max concurrent worker threads
 #define MAX_CLIENTS     16                                                         // Max concurrent client connections
 #define MAX_ZONE_RUNTIME 7200                                                      // Safety: max zone runtime = 2 hours
 #define WATCHDOG_INTERVAL 30                                                       // Watchdog check interval in seconds
+#define CLOSE_RETRY_MS  1000                                                       // Retry interval when a valve fails to close
 
 // FIX: Rate Limiting Configuration
 #define MAX_TRACKED_IPS   256                                                      // Max IPs to track for rate limiting
@@ -48,9 +50,12 @@
 // -----------------------------------------------------------------------------
 // Shared state
 // -----------------------------------------------------------------------------
+// zone_lock guards zone_state, zone_end_ms and zone_timers, and is held across
+// every valve write, so a zone's valve and its deadline always change together.
 static int zone_state[MAX_ZONE+1];          // zone_state[z] = 1 if ON, 0 if OFF
+static int64_t zone_end_ms[MAX_ZONE+1];     // When the current run ends (0 = no run)
 static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
-static sem_t worker_slots;
+static pthread_cond_t zone_end_changed;     // Wakes the run timer when a deadline changes
 static sem_t client_slots;
 static pthread_mutex_t workers_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t *worker_list = NULL;
@@ -77,7 +82,6 @@ typedef struct {
 } ZoneTimer;
 
 static ZoneTimer zone_timers[MAX_ZONE+1];
-static pthread_mutex_t timer_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
 // -----------------------------------------------------------------------------
@@ -147,64 +151,98 @@ static void join_workers_and_cleanup(void) {
 // Zone control
 // -----------------------------------------------------------------------------
 
-static void set_zone_state(int zone, int state) {
+// Monotonic clock: run deadlines must not move when NTP steps the wall clock.
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Caller holds zone_lock. Returns 0, or -1 if the valve write failed.
+static int set_zone_state(int zone, int state) {
     if (zone < 1 || zone > MAX_ZONE) {
         fprintf(stderr, "set_zone_state: invalid zone %d\n", zone);
-        return;
+        return -1;
     }
 
-    pthread_mutex_lock(&zone_lock);
-    zone_state[zone] = state;
-    pthread_mutex_unlock(&zone_lock);
-
     mcp_lock();
-    mcp_set_zone_state(zone, state);
+    int rc = mcp_set_zone_state(zone, state);
     mcp_unlock();
 
+    // A valve that failed to close may still be open, so keep treating it as ON
+    int on = state || rc != 0;
+    zone_state[zone] = on;
+
     // Update zone timer tracking
-    pthread_mutex_lock(&timer_lock);
-    if (state) {
-        zone_timers[zone].start_time = time(NULL);
-    } else {
+    if (state || (on && zone_timers[zone].start_time == 0)) {
+        zone_timers[zone].start_time = now_ms() / 1000;
+    } else if (!on) {
         zone_timers[zone].start_time = 0;
         zone_timers[zone].max_duration = 0;
     }
-    pthread_mutex_unlock(&timer_lock);
 
-    fprintf(stderr, "Zone %d -> %s\n", zone, state ? "ON" : "OFF");
+    if (rc != 0) {
+        fprintf(stderr, "Zone %d: valve write failed (wanted %s)\n", zone, state ? "ON" : "OFF");
+    } else {
+        fprintf(stderr, "Zone %d -> %s\n", zone, state ? "ON" : "OFF");
+    }
+    return rc;
+}
+
+// Caller holds zone_lock. Ends any run on the zone. If the valve will not close
+// the deadline stays set, so the run timer keeps retrying until it does.
+static int stop_zone(int zone) {
+    int rc = set_zone_state(zone, 0);
+    zone_end_ms[zone] = rc == 0 ? 0 : now_ms() + CLOSE_RETRY_MS;
+    pthread_cond_signal(&zone_end_changed);
+    return rc;
+}
+
+// Starts a run, replacing any run already on the zone. The deadline is set
+// before the valve opens and under the same lock, so an open valve always has
+// one, and a replaced run has nothing left that can close the valve early.
+static int start_zone(int zone, int duration) {
+    pthread_mutex_lock(&zone_lock);
+    zone_timers[zone].max_duration = duration;
+    zone_end_ms[zone] = now_ms() + (int64_t)duration * 1000;
+    int rc = set_zone_state(zone, 1);
+    if (rc != 0) {
+        stop_zone(zone);
+    }
+    pthread_cond_signal(&zone_end_changed);
+    pthread_mutex_unlock(&zone_lock);
+    return rc;
 }
 
 // -----------------------------------------------------------------------------
-// Worker thread: executes timed zone control
+// Run timer thread: closes each zone when its current run ends
 // -----------------------------------------------------------------------------
 
-struct worker_arg {
-    int zone;
-    int duration;
-};
+static void *run_timer_thread(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&zone_lock);
 
-static void *worker_thread(void *arg) {
-    struct worker_arg *wa = arg;
+    while (1) {
+        int64_t now = now_ms();
+        int64_t next = 0;
 
-    if (!wa) {
-        fprintf(stderr, "worker_thread: null arg\n");
-        return NULL;
+        for (int z = 1; z <= MAX_ZONE; z++) {
+            if (zone_end_ms[z] != 0 && zone_end_ms[z] <= now) {
+                stop_zone(z);
+            }
+            if (zone_end_ms[z] != 0 && (next == 0 || zone_end_ms[z] < next)) {
+                next = zone_end_ms[z];
+            }
+        }
+
+        if (next == 0) {
+            pthread_cond_wait(&zone_end_changed, &zone_lock);
+        } else {
+            struct timespec ts = { .tv_sec = next / 1000, .tv_nsec = (next % 1000) * 1000000 };
+            pthread_cond_timedwait(&zone_end_changed, &zone_lock, &ts);
+        }
     }
 
-    // Record max duration for watchdog
-    pthread_mutex_lock(&timer_lock);
-    zone_timers[wa->zone].max_duration = wa->duration;
-    pthread_mutex_unlock(&timer_lock);
-
-    set_zone_state(wa->zone, 1);
-    if (wa->duration > 0) {
-        sleep(wa->duration);                                                       // Blocks this thread only
-        set_zone_state(wa->zone, 0);
-    }
-
-    free(wa);
-    sem_post(&worker_slots);
-    remove_worker(pthread_self());
     return NULL;
 }
 
@@ -274,35 +312,27 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     }
 
     if (duration == 0) {
-        set_zone_state(zone, 0);
+        pthread_mutex_lock(&zone_lock);
+        int rc = stop_zone(zone);
+        pthread_mutex_unlock(&zone_lock);
+        if (rc != 0) {
+            const char err[] = "ERR valve write failed\n";
+            write(cfd, err, sizeof(err) - 1);
+            fprintf(stderr, "[%s] Zone %d stop failed, retrying\n", addrbuf, zone);
+            return -1;
+        }
         const char ok[] = "OK\n";
         write(cfd, ok, sizeof(ok) - 1);
         fprintf(stderr, "[%s] Zone %d OFF (immediate stop)\n", addrbuf, zone);
         return 0;
     }
-    
-    if (sem_wait(&worker_slots) != 0) {
-        fprintf(stderr, "Failed to acquire worker slot: %s\n", strerror(errno));
-        const char err[] = "ERR server busy\n";
+
+    if (start_zone(zone, duration) != 0) {
+        const char err[] = "ERR valve write failed\n";
         write(cfd, err, sizeof(err) - 1);
+        fprintf(stderr, "[%s] Zone %d start failed\n", addrbuf, zone);
         return -1;
     }
-
-    struct worker_arg *wa = xmalloc(sizeof(struct worker_arg));
-    wa->zone = zone;
-    wa->duration = duration;
-
-    pthread_t tid;
-    int rc = pthread_create(&tid, NULL, worker_thread, wa);
-    if (rc != 0) {
-        fprintf(stderr, "pthread_create failed: %s\n", strerror(rc));
-        free(wa);
-        sem_post(&worker_slots);
-        const char err[] = "ERR cannot create worker\n";
-        write(cfd, err, sizeof(err) - 1);
-        return -1;
-    }
-    add_worker(tid);
 
     const char ok[] = "OK\n";
     write(cfd, ok, sizeof(ok) - 1);
@@ -443,29 +473,27 @@ static void *watchdog_thread(void *arg) {
     while (1) {
         sleep(WATCHDOG_INTERVAL);
         
-        time_t now = time(NULL);
-        pthread_mutex_lock(&timer_lock);
-        
+        time_t now = now_ms() / 1000;
+        pthread_mutex_lock(&zone_lock);
+
         for (int z = 1; z <= MAX_ZONE; z++) {
             if (zone_timers[z].start_time > 0) {
                 time_t elapsed = now - zone_timers[z].start_time;
-                int max_allowed = zone_timers[z].max_duration > 0 ? 
+                int max_allowed = zone_timers[z].max_duration > 0 ?
                                   zone_timers[z].max_duration : MAX_ZONE_RUNTIME;
-                
+
                 // Safety margin: add 60 seconds to account for timing variations
                 if (elapsed > (max_allowed + 60)) {
-                    pthread_mutex_unlock(&timer_lock);
                     fprintf(stderr, "WATCHDOG: Zone %d has been ON for %ld seconds (max %d), forcing OFF\n",
                             z, (long)elapsed, max_allowed);
-                    set_zone_state(z, 0);
-                    pthread_mutex_lock(&timer_lock);
+                    stop_zone(z);
                 }
             }
         }
-        
-        pthread_mutex_unlock(&timer_lock);
+
+        pthread_mutex_unlock(&zone_lock);
     }
-    
+
     return NULL;
 }
 
@@ -475,10 +503,32 @@ static void *watchdog_thread(void *arg) {
 
 static void shutdown_all_zones(void) {
     fprintf(stderr, "Startup safety: forcing all zones OFF...\n");
+    pthread_mutex_lock(&zone_lock);
     for (int z = 1; z <= MAX_ZONE; z++) {
-        set_zone_state(z, 0);
+        stop_zone(z);
     }
+    pthread_mutex_unlock(&zone_lock);
     fprintf(stderr, "All zones shut down\n");
+}
+
+// -----------------------------------------------------------------------------
+// Signal thread: close every valve before the daemon stops
+// -----------------------------------------------------------------------------
+
+static void *signal_thread(void *arg) {
+    int sig = 0;
+    sigwait((const sigset_t *)arg, &sig);
+    fprintf(stderr, "Received signal %d: closing all zones and exiting\n", sig);
+
+    // Keep the lock until exit, so no command can open a valve after this
+    pthread_mutex_lock(&zone_lock);
+    int failed = 0;
+    for (int z = 1; z <= MAX_ZONE; z++) {
+        failed |= stop_zone(z);
+    }
+
+    // A failure exit lets systemd restart us, and startup closes all zones again
+    exit(failed ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
 // -----------------------------------------------------------------------------
@@ -511,8 +561,34 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
+    // The run timer's deadlines are on the monotonic clock
+    pthread_condattr_t cond_attr;
+    pthread_condattr_init(&cond_attr);
+    pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&zone_end_changed, &cond_attr);
+    pthread_condattr_destroy(&cond_attr);
+
+    // Handle these in signal_thread only: threads inherit this mask
+    static sigset_t stop_signals;
+    sigemptyset(&stop_signals);
+    sigaddset(&stop_signals, SIGTERM);
+    sigaddset(&stop_signals, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &stop_signals, NULL);
+    signal(SIGPIPE, SIG_IGN);                                                      // A client hanging up must not kill us
+
     // Safety: Shutdown all zones on startup
     shutdown_all_zones();
+
+    // Runs depend on these threads, so refuse to start without them
+    pthread_t run_timer_tid, signal_tid;
+    int rtrc = pthread_create(&run_timer_tid, NULL, run_timer_thread, NULL);
+    int sgrc = pthread_create(&signal_tid, NULL, signal_thread, &stop_signals);
+    if (rtrc != 0 || sgrc != 0) {
+        fprintf(stderr, "ERROR: Failed to start run timer or signal thread: %s\n", strerror(rtrc ? rtrc : sgrc));
+        exit(EXIT_FAILURE);
+    }
+    pthread_detach(run_timer_tid);
+    pthread_detach(signal_tid);
 
     // Start watchdog thread
     pthread_t watchdog_tid;
@@ -524,7 +600,6 @@ int main(void) {
         fprintf(stderr, "Watchdog thread started successfully\n");
     }
 
-    sem_init(&worker_slots, 0, MAX_WORKERS);
     sem_init(&client_slots, 0, MAX_CLIENTS);
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
