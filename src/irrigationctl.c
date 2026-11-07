@@ -48,8 +48,15 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    // Send the command
-    if (send(sockfd, argv[1], strlen(argv[1]), 0) < 0) {
+    // Send the command. The daemon reads one line, so it must end in a newline
+    char line[512];
+    int len = snprintf(line, sizeof(line), "%s\n", argv[1]);
+    if (len < 0 || (size_t)len >= sizeof(line)) {
+        fprintf(stderr, "Command too long\n");
+        close(sockfd);
+        exit(EXIT_FAILURE);
+    }
+    if (send(sockfd, line, len, 0) < 0) {
         perror("send");
         close(sockfd);
         exit(EXIT_FAILURE);

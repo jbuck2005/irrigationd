@@ -12,6 +12,9 @@
 #include <time.h>                                                                  // Sleep handling
 #include <sys/time.h>                                                              // struct timeval for timeouts
 #include <stdarg.h>                                                                // Variadic functions
+#include <stdint.h>                                                                // int64_t for millisecond clocks
+#include <limits.h>                                                                // LONG_MAX for LRU eviction
+#include <signal.h>                                                                // SIGTERM/SIGINT/SIGPIPE handling
 
 #include "mcp23017.h"                                                              // MCP23017 driver interface
 
@@ -22,11 +25,12 @@
 // irrigation zones connected through an MCP23017 GPIO expander.
 //
 // Example command format (single line, terminated by newline):
-//   ZONE=1 TIME=30 TOKEN=changeme
+//   ZONE=1 TIME=30 TOKEN=your-long-random-token
 //
 // Commands:
 //   ZONE=n TIME=s [TOKEN=secret]                                                   // Turn zone n ON for s seconds
 //   ZONE=n TIME=0 [TOKEN=secret]                                                   // Turn zone n OFF immediately
+//   STATUS [TOKEN=secret]                                                          // Report every zone, see send_status()
 //
 // Token authentication is mandatory: if IRRIGATIOND_TOKEN is not set in the
 // environment (via /etc/default/irrigationd), the daemon refuses to start.       // Prevents insecure deployments
@@ -35,27 +39,29 @@
 
 #define SERVER_PORT     4242                                                       // TCP port to listen on
 #define CMD_BUF_SZ      256                                                        // Max command length in bytes
-#define MAX_WORKERS     32                                                         // Max concurrent worker threads
+#define STATUS_BUF_SZ   (32 + 16 * MAX_ZONE)                                       // Header, plus up to 16 bytes per zone
 #define MAX_CLIENTS     16                                                         // Max concurrent client connections
 #define MAX_ZONE_RUNTIME 7200                                                      // Safety: max zone runtime = 2 hours
 #define WATCHDOG_INTERVAL 30                                                       // Watchdog check interval in seconds
+#define CLOSE_RETRY_MS  1000                                                       // Retry interval when a valve fails to close
 
 // FIX: Rate Limiting Configuration
 #define MAX_TRACKED_IPS   256                                                      // Max IPs to track for rate limiting
-#define RATE_LIMIT_COUNT  10                                                       // Max connections per IP...
+#define RATE_LIMIT_COUNT  10                                                       // Max unauthenticated connections per IP...
 #define RATE_LIMIT_PERIOD 60                                                       // ...within this many seconds
+#define RATE_LIMIT_DELAY  1                                                        // Seconds an over-limit connection waits before its token is checked
+#define RATE_LIMIT_MAX_WAITING 2                                                   // Over-limit connections an IP may have open at once
 
 // -----------------------------------------------------------------------------
 // Shared state
 // -----------------------------------------------------------------------------
+// zone_lock guards zone_state, zone_end_ms and zone_timers, and is held across
+// every valve write, so a zone's valve and its deadline always change together.
 static int zone_state[MAX_ZONE+1];          // zone_state[z] = 1 if ON, 0 if OFF
+static int64_t zone_end_ms[MAX_ZONE+1];     // When the current run ends (0 = no run)
 static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
-static sem_t worker_slots;
+static pthread_cond_t zone_end_changed;     // Wakes the run timer when a deadline changes
 static sem_t client_slots;
-static pthread_mutex_t workers_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_t *worker_list = NULL;
-static size_t worker_count = 0;
-static size_t worker_capacity = 0;
 static const char *g_auth_token = NULL;
 
 // FIX: Data structures for rate limiting
@@ -64,6 +70,7 @@ typedef struct {
     time_t timestamps[RATE_LIMIT_COUNT]; // Circular buffer of connection times
     int head;                           // Index of the oldest timestamp
     int count;                          // Number of timestamps in the buffer
+    int waiting;                        // Open connections that are over the limit
     time_t last_seen;                   // For LRU eviction
 } RateLimitEntry;
 
@@ -77,7 +84,6 @@ typedef struct {
 } ZoneTimer;
 
 static ZoneTimer zone_timers[MAX_ZONE+1];
-static pthread_mutex_t timer_lock = PTHREAD_MUTEX_INITIALIZER;
 
 
 // -----------------------------------------------------------------------------
@@ -93,131 +99,145 @@ static void *xmalloc(size_t sz) {
     return p;
 }
 
-static void *xrealloc(void *old, size_t sz) {
-    void *p = realloc(old, sz);
-    if (!p) {
-        fprintf(stderr, "realloc(%zu) failed: %s\n", sz, strerror(errno));         // stderr logging
-        exit(EXIT_FAILURE);
-    }
-    return p;
-}
-
-// -----------------------------------------------------------------------------
-// Worker tracking (ensures we can join all threads on shutdown)
-// -----------------------------------------------------------------------------
-
-static void add_worker(pthread_t tid) {
-    pthread_mutex_lock(&workers_lock);
-    if (worker_count == worker_capacity) {
-        size_t newcap = worker_capacity ? worker_capacity * 2 : 8;
-        pthread_t *newlist = xrealloc(worker_list, newcap * sizeof(pthread_t));
-        worker_list = newlist;
-        worker_capacity = newcap;
-    }
-    worker_list[worker_count++] = tid;
-    pthread_mutex_unlock(&workers_lock);
-}
-
-static void remove_worker(pthread_t tid) {
-    pthread_mutex_lock(&workers_lock);
-    for (size_t i = 0; i < worker_count; i++) {
-        if (pthread_equal(worker_list[i], tid)) {
-            worker_list[i] = worker_list[--worker_count];
-            break;
-        }
-    }
-    pthread_mutex_unlock(&workers_lock);
-}
-
-static void join_workers_and_cleanup(void) {
-    pthread_mutex_lock(&workers_lock);
-    for (size_t i = 0; i < worker_count; i++) {
-        int jrc = pthread_join(worker_list[i], NULL);
-        if (jrc != 0) {
-            fprintf(stderr, "pthread_join failed on worker %zu: %s\n", i, strerror(jrc));
-        }
-    }
-    free(worker_list);
-    worker_list = NULL;
-    worker_count = worker_capacity = 0;
-    pthread_mutex_unlock(&workers_lock);
-}
-
 // -----------------------------------------------------------------------------
 // Zone control
 // -----------------------------------------------------------------------------
 
-static void set_zone_state(int zone, int state) {
+// Monotonic clock: run deadlines must not move when NTP steps the wall clock.
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// Caller holds zone_lock. Returns 0, or -1 if the valve write failed.
+static int set_zone_state(int zone, int state) {
     if (zone < 1 || zone > MAX_ZONE) {
         fprintf(stderr, "set_zone_state: invalid zone %d\n", zone);
-        return;
+        return -1;
     }
 
-    pthread_mutex_lock(&zone_lock);
-    zone_state[zone] = state;
-    pthread_mutex_unlock(&zone_lock);
-
     mcp_lock();
-    mcp_set_zone_state(zone, state);
+    int rc = mcp_set_zone_state(zone, state);
     mcp_unlock();
 
+    // A valve that failed to close may still be open, so keep treating it as ON
+    int on = state || rc != 0;
+    zone_state[zone] = on;
+
     // Update zone timer tracking
-    pthread_mutex_lock(&timer_lock);
-    if (state) {
-        zone_timers[zone].start_time = time(NULL);
-    } else {
+    if (state || (on && zone_timers[zone].start_time == 0)) {
+        zone_timers[zone].start_time = now_ms() / 1000;
+    } else if (!on) {
         zone_timers[zone].start_time = 0;
         zone_timers[zone].max_duration = 0;
     }
-    pthread_mutex_unlock(&timer_lock);
 
-    fprintf(stderr, "Zone %d -> %s\n", zone, state ? "ON" : "OFF");
+    if (rc != 0) {
+        fprintf(stderr, "Zone %d: valve write failed (wanted %s)\n", zone, state ? "ON" : "OFF");
+    } else {
+        fprintf(stderr, "Zone %d -> %s\n", zone, state ? "ON" : "OFF");
+    }
+    return rc;
+}
+
+// Caller holds zone_lock. Ends any run on the zone. If the valve will not close
+// the deadline stays set, so the run timer keeps retrying until it does.
+static int stop_zone(int zone) {
+    int rc = set_zone_state(zone, 0);
+    zone_end_ms[zone] = rc == 0 ? 0 : now_ms() + CLOSE_RETRY_MS;
+    pthread_cond_signal(&zone_end_changed);
+    return rc;
+}
+
+// Starts a run, replacing any run already on the zone. The deadline is set
+// before the valve opens and under the same lock, so an open valve always has
+// one, and a replaced run has nothing left that can close the valve early.
+static int start_zone(int zone, int duration) {
+    pthread_mutex_lock(&zone_lock);
+    zone_timers[zone].max_duration = duration;
+    zone_end_ms[zone] = now_ms() + (int64_t)duration * 1000;
+    int rc = set_zone_state(zone, 1);
+    if (rc != 0) {
+        stop_zone(zone);
+    }
+    pthread_cond_signal(&zone_end_changed);
+    pthread_mutex_unlock(&zone_lock);
+    return rc;
 }
 
 // -----------------------------------------------------------------------------
-// Worker thread: executes timed zone control
+// Run timer thread: closes each zone when its current run ends
 // -----------------------------------------------------------------------------
 
-struct worker_arg {
-    int zone;
-    int duration;
-};
+static void *run_timer_thread(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&zone_lock);
 
-static void *worker_thread(void *arg) {
-    struct worker_arg *wa = arg;
+    while (1) {
+        int64_t now = now_ms();
+        int64_t next = 0;
 
-    if (!wa) {
-        fprintf(stderr, "worker_thread: null arg\n");
-        return NULL;
+        for (int z = 1; z <= MAX_ZONE; z++) {
+            if (zone_end_ms[z] != 0 && zone_end_ms[z] <= now) {
+                stop_zone(z);
+            }
+            if (zone_end_ms[z] != 0 && (next == 0 || zone_end_ms[z] < next)) {
+                next = zone_end_ms[z];
+            }
+        }
+
+        if (next == 0) {
+            pthread_cond_wait(&zone_end_changed, &zone_lock);
+        } else {
+            struct timespec ts = { .tv_sec = next / 1000, .tv_nsec = (next % 1000) * 1000000 };
+            pthread_cond_timedwait(&zone_end_changed, &zone_lock, &ts);
+        }
     }
 
-    // Record max duration for watchdog
-    pthread_mutex_lock(&timer_lock);
-    zone_timers[wa->zone].max_duration = wa->duration;
-    pthread_mutex_unlock(&timer_lock);
-
-    set_zone_state(wa->zone, 1);
-    if (wa->duration > 0) {
-        sleep(wa->duration);                                                       // Blocks this thread only
-        set_zone_state(wa->zone, 0);
-    }
-
-    free(wa);
-    sem_post(&worker_slots);
-    remove_worker(pthread_self());
     return NULL;
+}
+
+// -----------------------------------------------------------------------------
+// Status report
+// -----------------------------------------------------------------------------
+
+// Writes one line reporting every zone, without touching any valve:
+//   OK STATUS V=1 ZONES=14 Z1=OFF:0 Z2=ON:28 ... Z14=OFF:0
+// Each zone is Zn=STATE:SECONDS, with seconds remaining rounded up. The README
+// documents this format and the Home Assistant integration parses it, so change
+// V if the meaning of an existing field ever changes.
+static void send_status(int cfd) {
+    char line[STATUS_BUF_SZ];
+    int len = snprintf(line, sizeof(line), "OK STATUS V=1 ZONES=%d", MAX_ZONE);
+
+    pthread_mutex_lock(&zone_lock);
+    int64_t now = now_ms();
+    for (int z = 1; z <= MAX_ZONE; z++) {
+        int64_t left_ms = zone_state[z] ? zone_end_ms[z] - now : 0;
+        long seconds = left_ms > 0 ? (long)((left_ms + 999) / 1000) : 0;
+        len += snprintf(line + len, sizeof(line) - len, " Z%d=%s:%ld",
+                        z, zone_state[z] ? "ON" : "OFF", seconds);
+    }
+    pthread_mutex_unlock(&zone_lock);
+
+    line[len++] = '\n';
+    write(cfd, line, len);
 }
 
 // -----------------------------------------------------------------------------
 // Command parser
 // -----------------------------------------------------------------------------
 
-static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
+// Sets *authenticated once the token has been accepted, whatever happens after.
+static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
+                         int over_limit, int *authenticated) {
     char cmd[CMD_BUF_SZ];
     strncpy(cmd, cmd_const, sizeof(cmd));
     cmd[sizeof(cmd) - 1] = '\0';
 
     char *p_zone = NULL, *p_time = NULL, *p_token = NULL;
+    int want_status = 0;
     char *saveptr;
     char *token = strtok_r(cmd, " \t\n\r", &saveptr);
 
@@ -228,21 +248,35 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
             p_time = token + 5;
         } else if (strncmp(token, "TOKEN=", 6) == 0) {
             p_token = token + 6;
+        } else if (strcmp(token, "STATUS") == 0) {
+            want_status = 1;
         }
         token = strtok_r(NULL, " \t\n\r", &saveptr);
+    }
+
+    if (!p_token || strcmp(p_token, g_auth_token) != 0) {
+        const char auth_err[] = "ERR auth required\n";
+        const char limit_err[] = "ERR rate limit exceeded\n";
+        if (over_limit) {
+            write(cfd, limit_err, sizeof(limit_err) - 1);
+        } else {
+            write(cfd, auth_err, sizeof(auth_err) - 1);
+        }
+        fprintf(stderr, "[%s] Rejected command (bad/missing token)\n", addrbuf);
+        return -1;
+    }
+    *authenticated = 1;
+
+    // Not logged: this is polled, and would flood the journal
+    if (want_status) {
+        send_status(cfd);
+        return 0;
     }
 
     if (!p_zone || !p_time) {
         const char err[] = "ERR missing ZONE or TIME\n";
         write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (missing ZONE/TIME): '%s'\n", addrbuf, cmd_const);
-        return -1;
-    }
-
-    if (!p_token || strcmp(p_token, g_auth_token) != 0) {
-        const char err[] = "ERR auth required\n";
-        write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (bad/missing token): '%s'\n", addrbuf, cmd_const);
+        fprintf(stderr, "[%s] Rejected command (missing ZONE/TIME)\n", addrbuf);
         return -1;
     }
 
@@ -251,7 +285,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     if (*endptr != '\0') {
         const char err[] = "ERR invalid ZONE format\n";
         write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (invalid zone format): '%s'\n", addrbuf, cmd_const);
+        fprintf(stderr, "[%s] Rejected command (invalid zone format)\n", addrbuf);
         return -1;
     }
 
@@ -259,7 +293,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     if (*endptr != '\0') {
         const char err[] = "ERR invalid TIME format\n";
         write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (invalid time format): '%s'\n", addrbuf, cmd_const);
+        fprintf(stderr, "[%s] Rejected command (invalid time format)\n", addrbuf);
         return -1;
     }
     
@@ -269,44 +303,36 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     if (zone < 1 || zone > MAX_ZONE || duration < 0 || duration > MAX_ZONE_RUNTIME) {
         const char err[] = "ERR invalid ZONE or TIME\n";
         write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (invalid zone/time): '%s'\n", addrbuf, cmd_const);
+        fprintf(stderr, "[%s] Rejected command (invalid zone/time)\n", addrbuf);
         return -1;
     }
 
     if (duration == 0) {
-        set_zone_state(zone, 0);
+        pthread_mutex_lock(&zone_lock);
+        int rc = stop_zone(zone);
+        pthread_mutex_unlock(&zone_lock);
+        if (rc != 0) {
+            const char err[] = "ERR valve write failed\n";
+            write(cfd, err, sizeof(err) - 1);
+            fprintf(stderr, "[%s] Zone %d stop failed, retrying\n", addrbuf, zone);
+            return -1;
+        }
         const char ok[] = "OK\n";
         write(cfd, ok, sizeof(ok) - 1);
         fprintf(stderr, "[%s] Zone %d OFF (immediate stop)\n", addrbuf, zone);
         return 0;
     }
-    
-    if (sem_wait(&worker_slots) != 0) {
-        fprintf(stderr, "Failed to acquire worker slot: %s\n", strerror(errno));
-        const char err[] = "ERR server busy\n";
+
+    if (start_zone(zone, duration) != 0) {
+        const char err[] = "ERR valve write failed\n";
         write(cfd, err, sizeof(err) - 1);
+        fprintf(stderr, "[%s] Zone %d start failed\n", addrbuf, zone);
         return -1;
     }
-
-    struct worker_arg *wa = xmalloc(sizeof(struct worker_arg));
-    wa->zone = zone;
-    wa->duration = duration;
-
-    pthread_t tid;
-    int rc = pthread_create(&tid, NULL, worker_thread, wa);
-    if (rc != 0) {
-        fprintf(stderr, "pthread_create failed: %s\n", strerror(rc));
-        free(wa);
-        sem_post(&worker_slots);
-        const char err[] = "ERR cannot create worker\n";
-        write(cfd, err, sizeof(err) - 1);
-        return -1;
-    }
-    add_worker(tid);
 
     const char ok[] = "OK\n";
     write(cfd, ok, sizeof(ok) - 1);
-    fprintf(stderr, "[%s] Accepted command: '%s'\n", addrbuf, cmd_const);
+    fprintf(stderr, "[%s] Zone %d ON for %d seconds\n", addrbuf, zone, duration);
     return 0;
 }
 
@@ -343,15 +369,106 @@ static ssize_t read_line(int fd, char *buf, size_t sz) {
     return (ssize_t)i;
 }
 
+// -----------------------------------------------------------------------------
+// Rate Limiting Logic
+//
+// Only connections that fail to authenticate count. Each one is recorded when
+// accepted and the record is cleared when a valid token arrives, so a client
+// with the token never reaches the limit however often it connects. Once an IP
+// is over the limit its connections are still read, so a valid Stop still works:
+// each waits RATE_LIMIT_DELAY before its token is checked, valid or not, which
+// paces guessing, and at most RATE_LIMIT_MAX_WAITING may be open at once, so one
+// IP cannot hold every client slot.
+// -----------------------------------------------------------------------------
+
+enum rate_limit_result { RATE_OK, RATE_OVER_LIMIT, RATE_REFUSED };
+
+// Caller holds rate_limit_lock. Returns NULL if the IP is not tracked and !create.
+static RateLimitEntry *find_rate_limit_entry(struct in_addr client_ip, int create) {
+    int evict_idx = 0;
+    time_t oldest_seen = LONG_MAX;
+
+    for (int i = 0; i < MAX_TRACKED_IPS; ++i) {
+        if (rate_limit_table[i].ip_addr == client_ip.s_addr) {
+            return &rate_limit_table[i];
+        }
+        if (rate_limit_table[i].last_seen < oldest_seen) {
+            oldest_seen = rate_limit_table[i].last_seen;
+            evict_idx = i;
+        }
+    }
+
+    if (!create) {
+        return NULL;
+    }
+
+    // IP not found, evict the least recently seen entry
+    RateLimitEntry *entry = &rate_limit_table[evict_idx];
+    memset(entry, 0, sizeof(*entry));
+    entry->ip_addr = client_ip.s_addr;
+    return entry;
+}
+
+// Records a newly accepted connection, which counts as a failure until it
+// authenticates. RATE_OVER_LIMIT must be paired with rate_limit_finish().
+static enum rate_limit_result rate_limit_accept(struct in_addr client_ip) {
+    pthread_mutex_lock(&rate_limit_lock);
+
+    time_t now = now_ms() / 1000;
+    RateLimitEntry *entry = find_rate_limit_entry(client_ip, 1);
+    entry->last_seen = now;
+
+    // If buffer is full, the oldest timestamp is at the current head
+    if (entry->count == RATE_LIMIT_COUNT && now - entry->timestamps[entry->head] < RATE_LIMIT_PERIOD) {
+        enum rate_limit_result result = RATE_REFUSED;
+        if (entry->waiting < RATE_LIMIT_MAX_WAITING) {
+            entry->waiting++;
+            result = RATE_OVER_LIMIT;
+        }
+        pthread_mutex_unlock(&rate_limit_lock);
+        return result;
+    }
+
+    // Record the new connection timestamp
+    entry->timestamps[entry->head] = now;
+    entry->head = (entry->head + 1) % RATE_LIMIT_COUNT;
+    if (entry->count < RATE_LIMIT_COUNT) {
+        entry->count++;
+    }
+
+    pthread_mutex_unlock(&rate_limit_lock);
+    return RATE_OK;
+}
+
+// Called when a connection ends. A valid token clears the IP's failures.
+static void rate_limit_finish(struct in_addr client_ip, int over_limit, int authenticated) {
+    pthread_mutex_lock(&rate_limit_lock);
+
+    RateLimitEntry *entry = find_rate_limit_entry(client_ip, 0);
+    if (entry) {
+        if (over_limit && entry->waiting > 0) {
+            entry->waiting--;
+        }
+        if (authenticated) {
+            entry->count = 0;
+            entry->head = 0;
+        }
+    }
+
+    pthread_mutex_unlock(&rate_limit_lock);
+}
+
 struct client_arg {
     int cfd;
     struct sockaddr_in cli;
+    int over_limit;
 };
 
 static void *client_thread(void *arg) {
     struct client_arg *carg = arg;
     int cfd = carg->cfd;
     struct sockaddr_in cli = carg->cli;
+    int over_limit = carg->over_limit;
     free(carg);
 
     char addrbuf[64];
@@ -363,73 +480,21 @@ static void *client_thread(void *arg) {
     (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     char buf[CMD_BUF_SZ];
+    int authenticated = 0;
     ssize_t n = read_line(cfd, buf, sizeof(buf));
     if (n > 0) {
-        parse_command(cfd, buf, addrbuf);
+        if (over_limit) {
+            sleep(RATE_LIMIT_DELAY);
+        }
+        parse_command(cfd, buf, addrbuf, over_limit, &authenticated);
     } else if (n < 0) {
         fprintf(stderr, "[%s] read from client failed: %s\n", addrbuf, strerror(errno));
     }
 
     close(cfd);
+    rate_limit_finish(cli.sin_addr, over_limit, authenticated);
     sem_post(&client_slots);
-    remove_worker(pthread_self());
     return NULL;
-}
-
-// -----------------------------------------------------------------------------
-// Rate Limiting Logic
-// -----------------------------------------------------------------------------
-
-// FIX: New function to check and update rate limits for a given IP
-static int is_rate_limited(struct in_addr client_ip) {
-    pthread_mutex_lock(&rate_limit_lock);
-
-    time_t now = time(NULL);
-    int found_idx = -1;
-    int evict_idx = 0; // Default to evicting the first entry
-    time_t oldest_seen = (time_t)-1;
-
-    for (int i = 0; i < MAX_TRACKED_IPS; ++i) {
-        if (rate_limit_table[i].ip_addr == client_ip.s_addr) {
-            found_idx = i;
-            break;
-        }
-        if (rate_limit_table[i].last_seen < oldest_seen) {
-            oldest_seen = rate_limit_table[i].last_seen;
-            evict_idx = i;
-        }
-    }
-
-    if (found_idx == -1) {
-        // IP not found, evict the least recently seen entry
-        found_idx = evict_idx;
-        rate_limit_table[found_idx].ip_addr = client_ip.s_addr;
-        rate_limit_table[found_idx].count = 0;
-        rate_limit_table[found_idx].head = 0;
-    }
-
-    RateLimitEntry *entry = &rate_limit_table[found_idx];
-    entry->last_seen = now;
-
-    // If buffer is full, the oldest timestamp is at the current head
-    if (entry->count == RATE_LIMIT_COUNT) {
-        time_t oldest_ts = entry->timestamps[entry->head];
-        if (now - oldest_ts < RATE_LIMIT_PERIOD) {
-            // All timestamps are within the rate limit period
-            pthread_mutex_unlock(&rate_limit_lock);
-            return 1; // Rate limited
-        }
-    }
-
-    // Record the new connection timestamp
-    entry->timestamps[entry->head] = now;
-    entry->head = (entry->head + 1) % RATE_LIMIT_COUNT;
-    if (entry->count < RATE_LIMIT_COUNT) {
-        entry->count++;
-    }
-
-    pthread_mutex_unlock(&rate_limit_lock);
-    return 0; // Not rate limited
 }
 
 // -----------------------------------------------------------------------------
@@ -443,29 +508,27 @@ static void *watchdog_thread(void *arg) {
     while (1) {
         sleep(WATCHDOG_INTERVAL);
         
-        time_t now = time(NULL);
-        pthread_mutex_lock(&timer_lock);
-        
+        time_t now = now_ms() / 1000;
+        pthread_mutex_lock(&zone_lock);
+
         for (int z = 1; z <= MAX_ZONE; z++) {
             if (zone_timers[z].start_time > 0) {
                 time_t elapsed = now - zone_timers[z].start_time;
-                int max_allowed = zone_timers[z].max_duration > 0 ? 
+                int max_allowed = zone_timers[z].max_duration > 0 ?
                                   zone_timers[z].max_duration : MAX_ZONE_RUNTIME;
-                
+
                 // Safety margin: add 60 seconds to account for timing variations
                 if (elapsed > (max_allowed + 60)) {
-                    pthread_mutex_unlock(&timer_lock);
                     fprintf(stderr, "WATCHDOG: Zone %d has been ON for %ld seconds (max %d), forcing OFF\n",
                             z, (long)elapsed, max_allowed);
-                    set_zone_state(z, 0);
-                    pthread_mutex_lock(&timer_lock);
+                    stop_zone(z);
                 }
             }
         }
-        
-        pthread_mutex_unlock(&timer_lock);
+
+        pthread_mutex_unlock(&zone_lock);
     }
-    
+
     return NULL;
 }
 
@@ -475,10 +538,32 @@ static void *watchdog_thread(void *arg) {
 
 static void shutdown_all_zones(void) {
     fprintf(stderr, "Startup safety: forcing all zones OFF...\n");
+    pthread_mutex_lock(&zone_lock);
     for (int z = 1; z <= MAX_ZONE; z++) {
-        set_zone_state(z, 0);
+        stop_zone(z);
     }
+    pthread_mutex_unlock(&zone_lock);
     fprintf(stderr, "All zones shut down\n");
+}
+
+// -----------------------------------------------------------------------------
+// Signal thread: close every valve before the daemon stops
+// -----------------------------------------------------------------------------
+
+static void *signal_thread(void *arg) {
+    int sig = 0;
+    sigwait((const sigset_t *)arg, &sig);
+    fprintf(stderr, "Received signal %d: closing all zones and exiting\n", sig);
+
+    // Keep the lock until exit, so no command can open a valve after this
+    pthread_mutex_lock(&zone_lock);
+    int failed = 0;
+    for (int z = 1; z <= MAX_ZONE; z++) {
+        failed |= stop_zone(z);
+    }
+
+    // A failure exit lets systemd restart us, and startup closes all zones again
+    exit(failed ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
 // -----------------------------------------------------------------------------
@@ -511,8 +596,34 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
+    // The run timer's deadlines are on the monotonic clock
+    pthread_condattr_t cond_attr;
+    pthread_condattr_init(&cond_attr);
+    pthread_condattr_setclock(&cond_attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&zone_end_changed, &cond_attr);
+    pthread_condattr_destroy(&cond_attr);
+
+    // Handle these in signal_thread only: threads inherit this mask
+    static sigset_t stop_signals;
+    sigemptyset(&stop_signals);
+    sigaddset(&stop_signals, SIGTERM);
+    sigaddset(&stop_signals, SIGINT);
+    pthread_sigmask(SIG_BLOCK, &stop_signals, NULL);
+    signal(SIGPIPE, SIG_IGN);                                                      // A client hanging up must not kill us
+
     // Safety: Shutdown all zones on startup
     shutdown_all_zones();
+
+    // Runs depend on these threads, so refuse to start without them
+    pthread_t run_timer_tid, signal_tid;
+    int rtrc = pthread_create(&run_timer_tid, NULL, run_timer_thread, NULL);
+    int sgrc = pthread_create(&signal_tid, NULL, signal_thread, &stop_signals);
+    if (rtrc != 0 || sgrc != 0) {
+        fprintf(stderr, "ERROR: Failed to start run timer or signal thread: %s\n", strerror(rtrc ? rtrc : sgrc));
+        exit(EXIT_FAILURE);
+    }
+    pthread_detach(run_timer_tid);
+    pthread_detach(signal_tid);
 
     // Start watchdog thread
     pthread_t watchdog_tid;
@@ -524,7 +635,6 @@ int main(void) {
         fprintf(stderr, "Watchdog thread started successfully\n");
     }
 
-    sem_init(&worker_slots, 0, MAX_WORKERS);
     sem_init(&client_slots, 0, MAX_CLIENTS);
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -571,8 +681,9 @@ int main(void) {
             continue;
         }
 
-        // FIX: Check rate limit before processing the connection
-        if (is_rate_limited(cli.sin_addr)) {
+        // Only refuses an IP already over the limit with connections waiting
+        enum rate_limit_result rate = rate_limit_accept(cli.sin_addr);
+        if (rate == RATE_REFUSED) {
             char addrbuf[64];
             format_client_addr(&cli, addrbuf, sizeof(addrbuf));
             fprintf(stderr, "[%s] Connection rejected: rate limit exceeded\n", addrbuf);
@@ -587,12 +698,14 @@ int main(void) {
             const char err[] = "ERR server busy\n";
             write(cfd, err, sizeof(err) - 1);
             close(cfd);
+            rate_limit_finish(cli.sin_addr, rate == RATE_OVER_LIMIT, 0);
             continue;
         }
 
         struct client_arg *carg = xmalloc(sizeof(struct client_arg));
         carg->cfd = cfd;
         carg->cli = cli;
+        carg->over_limit = rate == RATE_OVER_LIMIT;
 
         pthread_t tid;
         if (pthread_create(&tid, NULL, client_thread, carg) != 0) {
@@ -600,12 +713,12 @@ int main(void) {
             close(cfd);
             free(carg);
             sem_post(&client_slots);
+            rate_limit_finish(cli.sin_addr, rate == RATE_OVER_LIMIT, 0);
             continue;
         }
-        add_worker(tid);
+        pthread_detach(tid);                                                       // Frees its stack on exit
     }
 
     close(listen_fd);
-    join_workers_and_cleanup();
     return 0;
 }
