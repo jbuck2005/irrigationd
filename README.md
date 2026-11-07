@@ -8,8 +8,9 @@ It consists of three main components:
 1. **irrigationd** – the daemon (background service) that listens for commands
    over TCP and controls irrigation zones via the MCP23017.
 2. **irrigationctl** – a lightweight CLI tool to send commands to the daemon.
-3. **Home Assistant integration** – Python code that allows zones to be managed
-   from Home Assistant as switches.
+3. **Home Assistant integration** – a separate project,
+   [irrigation-ha](https://github.com/jbuck2005/irrigation-ha), that lets you
+   manage zones from Home Assistant.
 
 ---
 
@@ -84,24 +85,20 @@ echo "ZONE=1 TIME=10 TOKEN=your-long-random-token" | nc 127.0.0.1 4242
 
 ## 🏠 Home Assistant Integration
 
-A custom integration is provided under `custom_components/irrigation/`. Copy
-this directory into your Home Assistant `custom_components` folder.
+The integration lives in its own repository,
+[irrigation-ha](https://github.com/jbuck2005/irrigation-ha). Follow the
+installation steps there, then set it up from the Home Assistant UI. There is
+nothing to add to `configuration.yaml`.
 
-Update your `configuration.yaml`:
+1. Go to **Settings → Devices & Services → Add Integration** and choose
+   **Irrigation Controller**.
+2. Enter the **Host** and **Port** of the machine running `irrigationd`
+   (port 4242 by default).
+3. Enter the number of **Zones** and a default run time.
+4. Enter the **Token**, which must match `IRRIGATIOND_TOKEN`.
 
-```yaml
-switch:
-  - platform: irrigation
-    host: 127.0.0.1
-    port: 4242
-    token: your-long-random-token
-    zones:
-      - 1
-      - 2
-      - 3
-```
-
-Restart Home Assistant. Each zone will appear as a switch.
+If Home Assistant runs on a different machine, set `IRRIGATIOND_BIND_ADDR` so
+that `irrigationd` accepts remote connections. See [Security Notes](#-security-notes).
 
 ---
 
