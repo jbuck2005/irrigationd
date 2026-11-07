@@ -79,13 +79,16 @@ irrigationctl "ZONE=1 TIME=0 TOKEN=your-long-random-token"
 `TIME` can be at most 7200 seconds (2 hours). Sending a new run to a zone that is
 already running replaces the old run, but a valve stays open for at most 2 hours
 in one go: a replacement that would go past that is shortened to fit and still
-gets `OK`, so use `STATUS` to see the real time left. Once no time is left, the
-reply is `ERR zone at maximum runtime`.
+gets `OK`, so use `STATUS` to see the real time left.
 
-This limits one continuous open, not total watering. The clock resets whenever
-the valve closes, whether from a stop or from the limit itself, so a client that
-keeps sending commands can reopen the valve straight away and keep watering with
-only a brief close.
+When a valve reaches 2 hours it closes, and new runs on that zone get
+`ERR zone at maximum runtime` for the next 10 minutes. This includes a single
+`TIME=7200` run that finishes normally. Stops always work, and a stop on that zone
+(`TIME=0`) ends the wait, so someone can override it deliberately. The wait is not
+kept across a daemon restart.
+
+A run that ends by itself before 2 hours, or is stopped, starts no wait, so this
+limits one continuous open, not total watering in a day.
 
 ### Status
 
