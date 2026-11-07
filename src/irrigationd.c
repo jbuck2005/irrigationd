@@ -229,6 +229,18 @@ static void send_status(int cfd) {
 // Command parser
 // -----------------------------------------------------------------------------
 
+// Looks at every byte of what was sent, so timing does not show how much matched.
+static int token_matches(const char *given) {
+    size_t want_len = strlen(g_auth_token);
+    size_t given_len = strlen(given);
+    size_t diff = want_len ^ given_len;
+
+    for (size_t i = 0; i < given_len; i++) {
+        diff |= (unsigned char)given[i] ^ (unsigned char)g_auth_token[i % want_len];
+    }
+    return diff == 0;
+}
+
 // Sets *authenticated once the token has been accepted, whatever happens after.
 static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
                          int over_limit, int *authenticated) {
@@ -254,7 +266,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
         token = strtok_r(NULL, " \t\n\r", &saveptr);
     }
 
-    if (!p_token || strcmp(p_token, g_auth_token) != 0) {
+    if (!p_token || !token_matches(p_token)) {
         const char auth_err[] = "ERR auth required\n";
         const char limit_err[] = "ERR rate limit exceeded\n";
         if (over_limit) {
@@ -591,10 +603,10 @@ int main(void) {
         }
     }
 
-    if (g_auth_token) {
+    if (g_auth_token && g_auth_token[0] != '\0') {
         fprintf(stderr, "Token enforcement enabled (IRRIGATIOND_TOKEN is set)\n");
     } else {
-        fprintf(stderr, "IRRIGATIOND_TOKEN is not set, refusing to start insecure\n");
+        fprintf(stderr, "IRRIGATIOND_TOKEN is not set or empty, refusing to start insecure\n");
         exit(EXIT_FAILURE);
     }
 
