@@ -121,17 +121,18 @@ int mcp_set_zone_state(int zone, int state) {
     uint8_t is_b, mask;
     if (zone_to_pin(zone, &is_b, &mask) < 0) return -1;
 
+    int rc;
     mcp_lock();
     if (is_b) {
         if (state) olat_b |= mask; else olat_b &= ~mask;
-        i2c_write_reg(MCP23017_OLATB, olat_b);
+        rc = i2c_write_reg(MCP23017_OLATB, olat_b);
     } else {
         if (state) olat_a |= mask; else olat_a &= ~mask;
-        i2c_write_reg(MCP23017_OLATA, olat_a);
+        rc = i2c_write_reg(MCP23017_OLATA, olat_a);
     }
     mcp_unlock();
 
-    return 0;
+    return rc;
 }
 
 int mcp_get_zone_state(int zone) {
