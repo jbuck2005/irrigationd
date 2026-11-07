@@ -66,6 +66,8 @@ static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t zone_end_changed;     // Wakes the run timer when a deadline changes
 static sem_t client_slots;
 static const char *g_auth_token = NULL;
+static struct in_addr g_trusted_addr;       // Exempt from the rate limit, if set
+static int g_have_trusted_addr = 0;
 
 // FIX: Data structures for rate limiting
 typedef struct {
@@ -437,7 +439,9 @@ static ssize_t read_line(int fd, char *buf, size_t sz) {
 // is over the limit its connections are still read, so a valid Stop still works:
 // each waits RATE_LIMIT_DELAY before its token is checked, valid or not, which
 // paces guessing, and at most RATE_LIMIT_MAX_WAITING may be open at once, so one
-// IP cannot hold every client slot.
+// IP cannot hold every client slot. That cap can refuse a valid Stop from an IP
+// that is flooding bad tokens, so IRRIGATIOND_TRUSTED_ADDR exempts one address,
+// meant for the host that already holds the token.
 // -----------------------------------------------------------------------------
 
 enum rate_limit_result { RATE_OK, RATE_OVER_LIMIT, RATE_REFUSED };
@@ -657,6 +661,16 @@ int main(void) {
         exit(EXIT_FAILURE);
     }
 
+    const char *trusted_env = getenv("IRRIGATIOND_TRUSTED_ADDR");
+    if (trusted_env && trusted_env[0] != '\0') {
+        if (inet_pton(AF_INET, trusted_env, &g_trusted_addr) == 1) {
+            g_have_trusted_addr = 1;
+            fprintf(stderr, "Rate limit does not apply to %s\n", trusted_env);
+        } else {
+            fprintf(stderr, "Invalid IRRIGATIOND_TRUSTED_ADDR '%s', rate limit applies to all clients\n", trusted_env);
+        }
+    }
+
     if (mcp_i2c_open("/dev/i2c-1") < 0) {
         fprintf(stderr, "ERROR: Failed to open I2C bus\n");
         exit(EXIT_FAILURE);
@@ -755,7 +769,8 @@ int main(void) {
         }
 
         // Only refuses an IP already over the limit with connections waiting
-        enum rate_limit_result rate = rate_limit_accept(cli.sin_addr);
+        int trusted = g_have_trusted_addr && cli.sin_addr.s_addr == g_trusted_addr.s_addr;
+        enum rate_limit_result rate = trusted ? RATE_OK : rate_limit_accept(cli.sin_addr);
         if (rate == RATE_REFUSED) {
             char addrbuf[64];
             format_client_addr(&cli, addrbuf, sizeof(addrbuf));
