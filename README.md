@@ -78,6 +78,22 @@ Turn off zone 1:
 irrigationctl "ZONE=1 TIME=0 TOKEN=your-long-random-token"
 ```
 
+### Run limits
+
+`TIME` can be at most 7200 seconds (2 hours). Sending a new run to a zone that is
+already running replaces the old run, but a valve stays open for at most 2 hours
+in one go: a replacement that would go past that is shortened to fit and still
+gets `OK`, so use `STATUS` to see the real time left.
+
+When a valve reaches 2 hours it closes, and new runs on that zone get
+`ERR zone at maximum runtime` for the next 10 minutes. This includes a single
+`TIME=7200` run that finishes normally. Stops always work, and a stop on that zone
+(`TIME=0`) ends the wait, so someone can override it deliberately. The wait is not
+kept across a daemon restart.
+
+A run that ends by itself before 2 hours, or is stopped, starts no wait, so this
+limits one continuous open, not total watering in a day.
+
 ### Status
 
 Report every zone without changing any valve:
