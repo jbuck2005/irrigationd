@@ -7,7 +7,6 @@ SRC_DIR := src
 OBJ_DIR := build
 BIN_DIR := bin
 SYSTEMD_DIR := systemd
-EXAMPLES_DIR := examples
 
 # Programs
 PROGRAMS := irrigationctl irrigationd
@@ -44,10 +43,10 @@ install: all
 	install -d $(DESTDIR)/etc/systemd/system
 	install -m 644 $(SYSTEMD_DIR)/irrigationd.service $(DESTDIR)/etc/systemd/system/
 	install -d $(DESTDIR)/etc/default
-	echo "Consdier running: sudo systemctl daemon-reload"
+	echo "Consider running: sudo systemctl daemon-reload"
 	echo ""
 	@if [ ! -f $(DESTDIR)/etc/default/irrigationd ]; then \
-		install -m 644 $(EXAMPLES_DIR)/irrigationd $(DESTDIR)/etc/default/irrigationd; \
+		install -m 600 irrigationd.default $(DESTDIR)/etc/default/irrigationd; \
 		echo "Installed default /etc/default/irrigationd"; \
 	else \
 		echo "Skipping /etc/default/irrigationd (already exists)"; \
