@@ -13,6 +13,7 @@
 #include <sys/time.h>                                                              // struct timeval for timeouts
 #include <stdarg.h>                                                                // Variadic functions
 #include <stdint.h>                                                                // int64_t for millisecond clocks
+#include <limits.h>                                                                // LONG_MAX for LRU eviction
 #include <signal.h>                                                                // SIGTERM/SIGINT/SIGPIPE handling
 
 #include "mcp23017.h"                                                              // MCP23017 driver interface
@@ -46,8 +47,10 @@
 
 // FIX: Rate Limiting Configuration
 #define MAX_TRACKED_IPS   256                                                      // Max IPs to track for rate limiting
-#define RATE_LIMIT_COUNT  10                                                       // Max connections per IP...
+#define RATE_LIMIT_COUNT  10                                                       // Max unauthenticated connections per IP...
 #define RATE_LIMIT_PERIOD 60                                                       // ...within this many seconds
+#define RATE_LIMIT_DELAY  1                                                        // Seconds an over-limit connection waits before its token is checked
+#define RATE_LIMIT_MAX_WAITING 2                                                   // Over-limit connections an IP may have open at once
 
 // -----------------------------------------------------------------------------
 // Shared state
@@ -67,6 +70,7 @@ typedef struct {
     time_t timestamps[RATE_LIMIT_COUNT]; // Circular buffer of connection times
     int head;                           // Index of the oldest timestamp
     int count;                          // Number of timestamps in the buffer
+    int waiting;                        // Open connections that are over the limit
     time_t last_seen;                   // For LRU eviction
 } RateLimitEntry;
 
@@ -225,7 +229,9 @@ static void send_status(int cfd) {
 // Command parser
 // -----------------------------------------------------------------------------
 
-static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
+// Sets *authenticated once the token has been accepted, whatever happens after.
+static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
+                         int over_limit, int *authenticated) {
     char cmd[CMD_BUF_SZ];
     strncpy(cmd, cmd_const, sizeof(cmd));
     cmd[sizeof(cmd) - 1] = '\0';
@@ -249,11 +255,17 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     }
 
     if (!p_token || strcmp(p_token, g_auth_token) != 0) {
-        const char err[] = "ERR auth required\n";
-        write(cfd, err, sizeof(err) - 1);
+        const char auth_err[] = "ERR auth required\n";
+        const char limit_err[] = "ERR rate limit exceeded\n";
+        if (over_limit) {
+            write(cfd, limit_err, sizeof(limit_err) - 1);
+        } else {
+            write(cfd, auth_err, sizeof(auth_err) - 1);
+        }
         fprintf(stderr, "[%s] Rejected command (bad/missing token)\n", addrbuf);
         return -1;
     }
+    *authenticated = 1;
 
     // Not logged: this is polled, and would flood the journal
     if (want_status) {
@@ -357,15 +369,106 @@ static ssize_t read_line(int fd, char *buf, size_t sz) {
     return (ssize_t)i;
 }
 
+// -----------------------------------------------------------------------------
+// Rate Limiting Logic
+//
+// Only connections that fail to authenticate count. Each one is recorded when
+// accepted and the record is cleared when a valid token arrives, so a client
+// with the token never reaches the limit however often it connects. Once an IP
+// is over the limit its connections are still read, so a valid Stop still works:
+// each waits RATE_LIMIT_DELAY before its token is checked, valid or not, which
+// paces guessing, and at most RATE_LIMIT_MAX_WAITING may be open at once, so one
+// IP cannot hold every client slot.
+// -----------------------------------------------------------------------------
+
+enum rate_limit_result { RATE_OK, RATE_OVER_LIMIT, RATE_REFUSED };
+
+// Caller holds rate_limit_lock. Returns NULL if the IP is not tracked and !create.
+static RateLimitEntry *find_rate_limit_entry(struct in_addr client_ip, int create) {
+    int evict_idx = 0;
+    time_t oldest_seen = LONG_MAX;
+
+    for (int i = 0; i < MAX_TRACKED_IPS; ++i) {
+        if (rate_limit_table[i].ip_addr == client_ip.s_addr) {
+            return &rate_limit_table[i];
+        }
+        if (rate_limit_table[i].last_seen < oldest_seen) {
+            oldest_seen = rate_limit_table[i].last_seen;
+            evict_idx = i;
+        }
+    }
+
+    if (!create) {
+        return NULL;
+    }
+
+    // IP not found, evict the least recently seen entry
+    RateLimitEntry *entry = &rate_limit_table[evict_idx];
+    memset(entry, 0, sizeof(*entry));
+    entry->ip_addr = client_ip.s_addr;
+    return entry;
+}
+
+// Records a newly accepted connection, which counts as a failure until it
+// authenticates. RATE_OVER_LIMIT must be paired with rate_limit_finish().
+static enum rate_limit_result rate_limit_accept(struct in_addr client_ip) {
+    pthread_mutex_lock(&rate_limit_lock);
+
+    time_t now = now_ms() / 1000;
+    RateLimitEntry *entry = find_rate_limit_entry(client_ip, 1);
+    entry->last_seen = now;
+
+    // If buffer is full, the oldest timestamp is at the current head
+    if (entry->count == RATE_LIMIT_COUNT && now - entry->timestamps[entry->head] < RATE_LIMIT_PERIOD) {
+        enum rate_limit_result result = RATE_REFUSED;
+        if (entry->waiting < RATE_LIMIT_MAX_WAITING) {
+            entry->waiting++;
+            result = RATE_OVER_LIMIT;
+        }
+        pthread_mutex_unlock(&rate_limit_lock);
+        return result;
+    }
+
+    // Record the new connection timestamp
+    entry->timestamps[entry->head] = now;
+    entry->head = (entry->head + 1) % RATE_LIMIT_COUNT;
+    if (entry->count < RATE_LIMIT_COUNT) {
+        entry->count++;
+    }
+
+    pthread_mutex_unlock(&rate_limit_lock);
+    return RATE_OK;
+}
+
+// Called when a connection ends. A valid token clears the IP's failures.
+static void rate_limit_finish(struct in_addr client_ip, int over_limit, int authenticated) {
+    pthread_mutex_lock(&rate_limit_lock);
+
+    RateLimitEntry *entry = find_rate_limit_entry(client_ip, 0);
+    if (entry) {
+        if (over_limit && entry->waiting > 0) {
+            entry->waiting--;
+        }
+        if (authenticated) {
+            entry->count = 0;
+            entry->head = 0;
+        }
+    }
+
+    pthread_mutex_unlock(&rate_limit_lock);
+}
+
 struct client_arg {
     int cfd;
     struct sockaddr_in cli;
+    int over_limit;
 };
 
 static void *client_thread(void *arg) {
     struct client_arg *carg = arg;
     int cfd = carg->cfd;
     struct sockaddr_in cli = carg->cli;
+    int over_limit = carg->over_limit;
     free(carg);
 
     char addrbuf[64];
@@ -377,72 +480,21 @@ static void *client_thread(void *arg) {
     (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     char buf[CMD_BUF_SZ];
+    int authenticated = 0;
     ssize_t n = read_line(cfd, buf, sizeof(buf));
     if (n > 0) {
-        parse_command(cfd, buf, addrbuf);
+        if (over_limit) {
+            sleep(RATE_LIMIT_DELAY);
+        }
+        parse_command(cfd, buf, addrbuf, over_limit, &authenticated);
     } else if (n < 0) {
         fprintf(stderr, "[%s] read from client failed: %s\n", addrbuf, strerror(errno));
     }
 
     close(cfd);
+    rate_limit_finish(cli.sin_addr, over_limit, authenticated);
     sem_post(&client_slots);
     return NULL;
-}
-
-// -----------------------------------------------------------------------------
-// Rate Limiting Logic
-// -----------------------------------------------------------------------------
-
-// FIX: New function to check and update rate limits for a given IP
-static int is_rate_limited(struct in_addr client_ip) {
-    pthread_mutex_lock(&rate_limit_lock);
-
-    time_t now = time(NULL);
-    int found_idx = -1;
-    int evict_idx = 0; // Default to evicting the first entry
-    time_t oldest_seen = (time_t)-1;
-
-    for (int i = 0; i < MAX_TRACKED_IPS; ++i) {
-        if (rate_limit_table[i].ip_addr == client_ip.s_addr) {
-            found_idx = i;
-            break;
-        }
-        if (rate_limit_table[i].last_seen < oldest_seen) {
-            oldest_seen = rate_limit_table[i].last_seen;
-            evict_idx = i;
-        }
-    }
-
-    if (found_idx == -1) {
-        // IP not found, evict the least recently seen entry
-        found_idx = evict_idx;
-        rate_limit_table[found_idx].ip_addr = client_ip.s_addr;
-        rate_limit_table[found_idx].count = 0;
-        rate_limit_table[found_idx].head = 0;
-    }
-
-    RateLimitEntry *entry = &rate_limit_table[found_idx];
-    entry->last_seen = now;
-
-    // If buffer is full, the oldest timestamp is at the current head
-    if (entry->count == RATE_LIMIT_COUNT) {
-        time_t oldest_ts = entry->timestamps[entry->head];
-        if (now - oldest_ts < RATE_LIMIT_PERIOD) {
-            // All timestamps are within the rate limit period
-            pthread_mutex_unlock(&rate_limit_lock);
-            return 1; // Rate limited
-        }
-    }
-
-    // Record the new connection timestamp
-    entry->timestamps[entry->head] = now;
-    entry->head = (entry->head + 1) % RATE_LIMIT_COUNT;
-    if (entry->count < RATE_LIMIT_COUNT) {
-        entry->count++;
-    }
-
-    pthread_mutex_unlock(&rate_limit_lock);
-    return 0; // Not rate limited
 }
 
 // -----------------------------------------------------------------------------
@@ -629,8 +681,9 @@ int main(void) {
             continue;
         }
 
-        // FIX: Check rate limit before processing the connection
-        if (is_rate_limited(cli.sin_addr)) {
+        // Only refuses an IP already over the limit with connections waiting
+        enum rate_limit_result rate = rate_limit_accept(cli.sin_addr);
+        if (rate == RATE_REFUSED) {
             char addrbuf[64];
             format_client_addr(&cli, addrbuf, sizeof(addrbuf));
             fprintf(stderr, "[%s] Connection rejected: rate limit exceeded\n", addrbuf);
@@ -645,12 +698,14 @@ int main(void) {
             const char err[] = "ERR server busy\n";
             write(cfd, err, sizeof(err) - 1);
             close(cfd);
+            rate_limit_finish(cli.sin_addr, rate == RATE_OVER_LIMIT, 0);
             continue;
         }
 
         struct client_arg *carg = xmalloc(sizeof(struct client_arg));
         carg->cfd = cfd;
         carg->cli = cli;
+        carg->over_limit = rate == RATE_OVER_LIMIT;
 
         pthread_t tid;
         if (pthread_create(&tid, NULL, client_thread, carg) != 0) {
@@ -658,6 +713,7 @@ int main(void) {
             close(cfd);
             free(carg);
             sem_post(&client_slots);
+            rate_limit_finish(cli.sin_addr, rate == RATE_OVER_LIMIT, 0);
             continue;
         }
         pthread_detach(tid);                                                       // Frees its stack on exit

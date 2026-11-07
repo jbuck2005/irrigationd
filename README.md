@@ -138,5 +138,9 @@ Restart Home Assistant. Each zone will appear as a switch.
 - Keep `IRRIGATIOND_BIND_ADDR=127.0.0.1` unless you explicitly need remote access.
 - Use a firewall if exposing the service beyond localhost.
 - Home Assistant integration must be configured with the same token.
+- After 10 connections from one IP fail to authenticate within 60 seconds, each
+  further connection from it waits 1 second before its token is checked, and at
+  most 2 may be open at once. A valid token is still accepted and clears the count.
+  Clients with the right token are not rate limited.
 
 ---
