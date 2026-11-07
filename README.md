@@ -38,7 +38,9 @@ IRRIGATIOND_TOKEN=your-long-random-token
 IRRIGATIOND_BIND_ADDR=127.0.0.1
 ```
 
-- **IRRIGATIOND_TOKEN** – required token for all commands. Generate your own with `openssl rand -hex 16`; never use the example value.
+- **IRRIGATIOND_TOKEN** – required token for all commands. A new install has this
+  line commented out, and the daemon refuses to start until you set it. Generate
+  your own with `openssl rand -hex 16`; never use the example value.
 - **IRRIGATIOND_BIND_ADDR** – set to `127.0.0.1` (default) to only accept local
   connections, or `0.0.0.0` to allow remote access.
 

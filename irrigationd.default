@@ -1,3 +1,4 @@
-# Required. Replace with your own value: openssl rand -hex 16
-IRRIGATIOND_TOKEN=CHANGE_ME_to_a_long_random_token
+# Required. The daemon refuses to start until this is set. Uncomment the line
+# below and add your own value, which you can generate with: openssl rand -hex 16
+#IRRIGATIOND_TOKEN=
 IRRIGATIOND_BIND_ADDR=127.0.0.1
