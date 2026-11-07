@@ -229,6 +229,15 @@ static void send_status(int cfd) {
 // Command parser
 // -----------------------------------------------------------------------------
 
+// Parses a whole decimal number. Returns -1 if it is empty, has anything after
+// the digits, or is too large for a long.
+static int parse_number(const char *text, long *value) {
+    char *endptr;
+    errno = 0;
+    *value = strtol(text, &endptr, 10);
+    return (endptr == text || *endptr != '\0' || errno != 0) ? -1 : 0;
+}
+
 // Looks at every byte of what was sent, so timing does not show how much matched.
 static int token_matches(const char *given) {
     size_t want_len = strlen(g_auth_token);
@@ -292,32 +301,32 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
         return -1;
     }
 
-    char *endptr;
-    long zone_l = strtol(p_zone, &endptr, 10);
-    if (*endptr != '\0') {
+    long zone_l;
+    if (parse_number(p_zone, &zone_l) != 0) {
         const char err[] = "ERR invalid ZONE format\n";
         write(cfd, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Rejected command (invalid zone format)\n", addrbuf);
         return -1;
     }
 
-    long duration_l = strtol(p_time, &endptr, 10);
-    if (*endptr != '\0') {
+    long duration_l;
+    if (parse_number(p_time, &duration_l) != 0) {
         const char err[] = "ERR invalid TIME format\n";
         write(cfd, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Rejected command (invalid time format)\n", addrbuf);
         return -1;
     }
     
-    int zone = (int)zone_l;
-    int duration = (int)duration_l;
-
-    if (zone < 1 || zone > MAX_ZONE || duration < 0 || duration > MAX_ZONE_RUNTIME) {
+    // Range check before narrowing, so a huge value cannot wrap into a valid one
+    if (zone_l < 1 || zone_l > MAX_ZONE || duration_l < 0 || duration_l > MAX_ZONE_RUNTIME) {
         const char err[] = "ERR invalid ZONE or TIME\n";
         write(cfd, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Rejected command (invalid zone/time)\n", addrbuf);
         return -1;
     }
+
+    int zone = (int)zone_l;
+    int duration = (int)duration_l;
 
     if (duration == 0) {
         pthread_mutex_lock(&zone_lock);
