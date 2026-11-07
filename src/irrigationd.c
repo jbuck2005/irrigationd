@@ -43,6 +43,7 @@
 #define MAX_CLIENTS     16                                                         // Max concurrent client connections
 #define MAX_ZONE_RUNTIME 7200                                                      // Safety: max zone runtime = 2 hours
 #define WATCHDOG_INTERVAL 30                                                       // Watchdog check interval in seconds
+#define ZONE_AT_LIMIT   1                                                          // start_zone: valve has been open for MAX_ZONE_RUNTIME
 #define CLOSE_RETRY_MS  1000                                                       // Retry interval when a valve fails to close
 
 // FIX: Rate Limiting Configuration
@@ -79,7 +80,7 @@ static pthread_mutex_t rate_limit_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // Safety: Watchdog data structures
 typedef struct {
-    time_t start_time;                  // When zone was turned ON (0 if OFF)
+    int64_t start_ms;                   // When the valve opened (0 if OFF)
     int max_duration;                   // Maximum allowed runtime in seconds
 } ZoneTimer;
 
@@ -126,10 +127,10 @@ static int set_zone_state(int zone, int state) {
     zone_state[zone] = on;
 
     // Update zone timer tracking
-    if (state || (on && zone_timers[zone].start_time == 0)) {
-        zone_timers[zone].start_time = now_ms() / 1000;
+    if (on && zone_timers[zone].start_ms == 0) {
+        zone_timers[zone].start_ms = now_ms();
     } else if (!on) {
-        zone_timers[zone].start_time = 0;
+        zone_timers[zone].start_ms = 0;
         zone_timers[zone].max_duration = 0;
     }
 
@@ -153,10 +154,28 @@ static int stop_zone(int zone) {
 // Starts a run, replacing any run already on the zone. The deadline is set
 // before the valve opens and under the same lock, so an open valve always has
 // one, and a replaced run has nothing left that can close the valve early.
+// MAX_ZONE_RUNTIME limits how long the valve stays open in one go, so replacing
+// a run cannot extend it past that: the new run is shortened to fit, and refused
+// with ZONE_AT_LIMIT if no time is left.
 static int start_zone(int zone, int duration) {
     pthread_mutex_lock(&zone_lock);
-    zone_timers[zone].max_duration = duration;
-    zone_end_ms[zone] = now_ms() + (int64_t)duration * 1000;
+    int64_t now = now_ms();
+    if (zone_timers[zone].start_ms == 0) {
+        zone_timers[zone].start_ms = now;
+    }
+
+    int64_t start_ms = zone_timers[zone].start_ms;
+    int64_t end_ms = now + (int64_t)duration * 1000;
+    if (end_ms > start_ms + (int64_t)MAX_ZONE_RUNTIME * 1000) {
+        end_ms = start_ms + (int64_t)MAX_ZONE_RUNTIME * 1000;
+    }
+    if (end_ms <= now) {
+        pthread_mutex_unlock(&zone_lock);
+        return ZONE_AT_LIMIT;
+    }
+
+    zone_timers[zone].max_duration = (int)((end_ms - start_ms + 999) / 1000);
+    zone_end_ms[zone] = end_ms;
     int rc = set_zone_state(zone, 1);
     if (rc != 0) {
         stop_zone(zone);
@@ -344,7 +363,14 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
         return 0;
     }
 
-    if (start_zone(zone, duration) != 0) {
+    int start_rc = start_zone(zone, duration);
+    if (start_rc == ZONE_AT_LIMIT) {
+        const char err[] = "ERR zone at maximum runtime\n";
+        write(cfd, err, sizeof(err) - 1);
+        fprintf(stderr, "[%s] Zone %d start refused: at maximum runtime\n", addrbuf, zone);
+        return -1;
+    }
+    if (start_rc != 0) {
         const char err[] = "ERR valve write failed\n";
         write(cfd, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Zone %d start failed\n", addrbuf, zone);
@@ -529,12 +555,12 @@ static void *watchdog_thread(void *arg) {
     while (1) {
         sleep(WATCHDOG_INTERVAL);
         
-        time_t now = now_ms() / 1000;
         pthread_mutex_lock(&zone_lock);
+        int64_t now = now_ms();
 
         for (int z = 1; z <= MAX_ZONE; z++) {
-            if (zone_timers[z].start_time > 0) {
-                time_t elapsed = now - zone_timers[z].start_time;
+            if (zone_timers[z].start_ms > 0) {
+                time_t elapsed = (now - zone_timers[z].start_ms) / 1000;
                 int max_allowed = zone_timers[z].max_duration > 0 ?
                                   zone_timers[z].max_duration : MAX_ZONE_RUNTIME;
 
