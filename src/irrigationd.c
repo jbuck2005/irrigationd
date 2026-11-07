@@ -235,14 +235,14 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     if (!p_zone || !p_time) {
         const char err[] = "ERR missing ZONE or TIME\n";
         write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (missing ZONE/TIME): '%s'\n", addrbuf, cmd_const);
+        fprintf(stderr, "[%s] Rejected command (missing ZONE/TIME)\n", addrbuf);
         return -1;
     }
 
     if (!p_token || strcmp(p_token, g_auth_token) != 0) {
         const char err[] = "ERR auth required\n";
         write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (bad/missing token): '%s'\n", addrbuf, cmd_const);
+        fprintf(stderr, "[%s] Rejected command (bad/missing token)\n", addrbuf);
         return -1;
     }
 
@@ -251,7 +251,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     if (*endptr != '\0') {
         const char err[] = "ERR invalid ZONE format\n";
         write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (invalid zone format): '%s'\n", addrbuf, cmd_const);
+        fprintf(stderr, "[%s] Rejected command (invalid zone format)\n", addrbuf);
         return -1;
     }
 
@@ -259,7 +259,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     if (*endptr != '\0') {
         const char err[] = "ERR invalid TIME format\n";
         write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (invalid time format): '%s'\n", addrbuf, cmd_const);
+        fprintf(stderr, "[%s] Rejected command (invalid time format)\n", addrbuf);
         return -1;
     }
     
@@ -269,7 +269,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     if (zone < 1 || zone > MAX_ZONE || duration < 0 || duration > MAX_ZONE_RUNTIME) {
         const char err[] = "ERR invalid ZONE or TIME\n";
         write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (invalid zone/time): '%s'\n", addrbuf, cmd_const);
+        fprintf(stderr, "[%s] Rejected command (invalid zone/time)\n", addrbuf);
         return -1;
     }
 
@@ -306,7 +306,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
 
     const char ok[] = "OK\n";
     write(cfd, ok, sizeof(ok) - 1);
-    fprintf(stderr, "[%s] Accepted command: '%s'\n", addrbuf, cmd_const);
+    fprintf(stderr, "[%s] Zone %d ON for %d seconds\n", addrbuf, zone, duration);
     return 0;
 }
 
