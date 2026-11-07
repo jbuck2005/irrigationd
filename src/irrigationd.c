@@ -566,6 +566,13 @@ static void *signal_thread(void *arg) {
     exit(failed ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
+// Example values from the docs and older default configs. They are public, so
+// they must never work as a token.
+static int is_example_token(const char *token) {
+    return strcmp(token, "CHANGE_ME_to_a_long_random_token") == 0 ||
+           strcmp(token, "your-long-random-token") == 0;
+}
+
 // -----------------------------------------------------------------------------
 // Main server loop
 // -----------------------------------------------------------------------------
@@ -613,6 +620,13 @@ int main(void) {
 
     // Safety: Shutdown all zones on startup
     shutdown_all_zones();
+
+    // Checked after closing the valves, so refusing to run can't leave one open
+    if (is_example_token(g_auth_token)) {
+        fprintf(stderr, "IRRIGATIOND_TOKEN is still an example value, refusing to start. "
+                        "Set your own in /etc/default/irrigationd: openssl rand -hex 16\n");
+        exit(EXIT_FAILURE);
+    }
 
     // Runs depend on these threads, so refuse to start without them
     pthread_t run_timer_tid, signal_tid;
