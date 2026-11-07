@@ -43,7 +43,8 @@
 #define MAX_CLIENTS     16                                                         // Max concurrent client connections
 #define MAX_ZONE_RUNTIME 7200                                                      // Safety: max zone runtime = 2 hours
 #define WATCHDOG_INTERVAL 30                                                       // Watchdog check interval in seconds
-#define ZONE_AT_LIMIT   1                                                          // start_zone: valve has been open for MAX_ZONE_RUNTIME
+#define ZONE_COOLDOWN_SECS 600                                                     // Wait after a valve reaches MAX_ZONE_RUNTIME
+#define ZONE_AT_LIMIT   1                                                          // start_zone: no time left, or still cooling down
 #define CLOSE_RETRY_MS  1000                                                       // Retry interval when a valve fails to close
 
 // FIX: Rate Limiting Configuration
@@ -60,6 +61,7 @@
 // every valve write, so a zone's valve and its deadline always change together.
 static int zone_state[MAX_ZONE+1];          // zone_state[z] = 1 if ON, 0 if OFF
 static int64_t zone_end_ms[MAX_ZONE+1];     // When the current run ends (0 = no run)
+static int64_t zone_reopen_ms[MAX_ZONE+1];  // Runs refused until this time (0 = none)
 static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t zone_end_changed;     // Wakes the run timer when a deadline changes
 static sem_t client_slots;
@@ -158,10 +160,16 @@ static int stop_zone(int zone) {
 // one, and a replaced run has nothing left that can close the valve early.
 // MAX_ZONE_RUNTIME limits how long the valve stays open in one go, so replacing
 // a run cannot extend it past that: the new run is shortened to fit, and refused
-// with ZONE_AT_LIMIT if no time is left.
+// with ZONE_AT_LIMIT if no time is left. It is also refused during the cooldown
+// that follows, so repeated commands can't reopen the valve as soon as it closes.
 static int start_zone(int zone, int duration) {
     pthread_mutex_lock(&zone_lock);
     int64_t now = now_ms();
+    if (now < zone_reopen_ms[zone]) {
+        pthread_mutex_unlock(&zone_lock);
+        return ZONE_AT_LIMIT;
+    }
+
     if (zone_timers[zone].start_ms == 0) {
         zone_timers[zone].start_ms = now;
     }
@@ -201,6 +209,9 @@ static void *run_timer_thread(void *arg) {
 
         for (int z = 1; z <= MAX_ZONE; z++) {
             if (zone_end_ms[z] != 0 && zone_end_ms[z] <= now) {
+                if (now - zone_timers[z].start_ms >= (int64_t)MAX_ZONE_RUNTIME * 1000) {
+                    zone_reopen_ms[z] = now + (int64_t)ZONE_COOLDOWN_SECS * 1000;
+                }
                 stop_zone(z);
             }
             if (zone_end_ms[z] != 0 && (next == 0 || zone_end_ms[z] < next)) {
@@ -351,6 +362,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
 
     if (duration == 0) {
         pthread_mutex_lock(&zone_lock);
+        zone_reopen_ms[zone] = 0;                                                  // A deliberate stop ends any cooldown
         int rc = stop_zone(zone);
         pthread_mutex_unlock(&zone_lock);
         if (rc != 0) {
@@ -617,6 +629,13 @@ static void *signal_thread(void *arg) {
     exit(failed ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
+// Example values from the docs and older default configs. They are public, so
+// they must never work as a token.
+static int is_example_token(const char *token) {
+    return strcmp(token, "CHANGE_ME_to_a_long_random_token") == 0 ||
+           strcmp(token, "your-long-random-token") == 0;
+}
+
 // -----------------------------------------------------------------------------
 // Main server loop
 // -----------------------------------------------------------------------------
@@ -674,6 +693,13 @@ int main(void) {
 
     // Safety: Shutdown all zones on startup
     shutdown_all_zones();
+
+    // Checked after closing the valves, so refusing to run can't leave one open
+    if (is_example_token(g_auth_token)) {
+        fprintf(stderr, "IRRIGATIOND_TOKEN is still an example value, refusing to start. "
+                        "Set your own in /etc/default/irrigationd: openssl rand -hex 16\n");
+        exit(EXIT_FAILURE);
+    }
 
     // Runs depend on these threads, so refuse to start without them
     pthread_t run_timer_tid, signal_tid;

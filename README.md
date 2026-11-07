@@ -8,8 +8,9 @@ It consists of three main components:
 1. **irrigationd** – the daemon (background service) that listens for commands
    over TCP and controls irrigation zones via the MCP23017.
 2. **irrigationctl** – a lightweight CLI tool to send commands to the daemon.
-3. **Home Assistant integration** – Python code that allows zones to be managed
-   from Home Assistant as switches.
+3. **Home Assistant integration** – a separate project,
+   [irrigation-ha](https://github.com/jbuck2005/irrigation-ha), that lets you
+   manage zones from Home Assistant.
 
 ---
 
@@ -40,7 +41,8 @@ IRRIGATIOND_BIND_ADDR=127.0.0.1
 
 - **IRRIGATIOND_TOKEN** – required token for all commands. A new install has this
   line commented out, and the daemon refuses to start until you set it. Generate
-  your own with `openssl rand -hex 16`; never use the example value.
+  your own with `openssl rand -hex 16`. The daemon also refuses to start with an
+  example value, including the placeholder from older default configs.
 - **IRRIGATIOND_BIND_ADDR** – set to `127.0.0.1` (default) to only accept local
   connections, or `0.0.0.0` to allow remote access.
 - **IRRIGATIOND_TRUSTED_ADDR** – optional. One IPv4 address that the rate limit
@@ -83,8 +85,16 @@ irrigationctl "ZONE=1 TIME=0 TOKEN=your-long-random-token"
 `TIME` can be at most 7200 seconds (2 hours). Sending a new run to a zone that is
 already running replaces the old run, but a valve stays open for at most 2 hours
 in one go: a replacement that would go past that is shortened to fit and still
-gets `OK`, so use `STATUS` to see the real time left. Once no time is left, the
-reply is `ERR zone at maximum runtime`. Stopping the zone resets the limit.
+gets `OK`, so use `STATUS` to see the real time left.
+
+When a valve reaches 2 hours it closes, and new runs on that zone get
+`ERR zone at maximum runtime` for the next 10 minutes. This includes a single
+`TIME=7200` run that finishes normally. Stops always work, and a stop on that zone
+(`TIME=0`) ends the wait, so someone can override it deliberately. The wait is not
+kept across a daemon restart.
+
+A run that ends by itself before 2 hours, or is stopped, starts no wait, so this
+limits one continuous open, not total watering in a day.
 
 ### Status
 
@@ -123,24 +133,20 @@ echo "ZONE=1 TIME=10 TOKEN=your-long-random-token" | nc 127.0.0.1 4242
 
 ## 🏠 Home Assistant Integration
 
-A custom integration is provided under `custom_components/irrigation/`. Copy
-this directory into your Home Assistant `custom_components` folder.
+The integration lives in its own repository,
+[irrigation-ha](https://github.com/jbuck2005/irrigation-ha). Follow the
+installation steps there, then set it up from the Home Assistant UI. There is
+nothing to add to `configuration.yaml`.
 
-Update your `configuration.yaml`:
+1. Go to **Settings → Devices & Services → Add Integration** and choose
+   **Irrigation Controller**.
+2. Enter the **Host** and **Port** of the machine running `irrigationd`
+   (port 4242 by default).
+3. Enter the number of **Zones** and a default run time.
+4. Enter the **Token**, which must match `IRRIGATIOND_TOKEN`.
 
-```yaml
-switch:
-  - platform: irrigation
-    host: 127.0.0.1
-    port: 4242
-    token: your-long-random-token
-    zones:
-      - 1
-      - 2
-      - 3
-```
-
-Restart Home Assistant. Each zone will appear as a switch.
+If Home Assistant runs on a different machine, set `IRRIGATIOND_BIND_ADDR` so
+that `irrigationd` accepts remote connections. See [Security Notes](#-security-notes).
 
 ---
 
