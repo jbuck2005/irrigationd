@@ -24,11 +24,12 @@
 // irrigation zones connected through an MCP23017 GPIO expander.
 //
 // Example command format (single line, terminated by newline):
-//   ZONE=1 TIME=30 TOKEN=changeme
+//   ZONE=1 TIME=30 TOKEN=your-long-random-token
 //
 // Commands:
 //   ZONE=n TIME=s [TOKEN=secret]                                                   // Turn zone n ON for s seconds
 //   ZONE=n TIME=0 [TOKEN=secret]                                                   // Turn zone n OFF immediately
+//   STATUS [TOKEN=secret]                                                          // Report every zone, see send_status()
 //
 // Token authentication is mandatory: if IRRIGATIOND_TOKEN is not set in the
 // environment (via /etc/default/irrigationd), the daemon refuses to start.       // Prevents insecure deployments
@@ -37,6 +38,7 @@
 
 #define SERVER_PORT     4242                                                       // TCP port to listen on
 #define CMD_BUF_SZ      256                                                        // Max command length in bytes
+#define STATUS_BUF_SZ   (32 + 16 * MAX_ZONE)                                       // Header, plus up to 16 bytes per zone
 #define MAX_CLIENTS     16                                                         // Max concurrent client connections
 #define MAX_ZONE_RUNTIME 7200                                                      // Safety: max zone runtime = 2 hours
 #define WATCHDOG_INTERVAL 30                                                       // Watchdog check interval in seconds
@@ -57,10 +59,6 @@ static int64_t zone_end_ms[MAX_ZONE+1];     // When the current run ends (0 = no
 static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t zone_end_changed;     // Wakes the run timer when a deadline changes
 static sem_t client_slots;
-static pthread_mutex_t workers_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_t *worker_list = NULL;
-static size_t worker_count = 0;
-static size_t worker_capacity = 0;
 static const char *g_auth_token = NULL;
 
 // FIX: Data structures for rate limiting
@@ -95,56 +93,6 @@ static void *xmalloc(size_t sz) {
         exit(EXIT_FAILURE);
     }
     return p;
-}
-
-static void *xrealloc(void *old, size_t sz) {
-    void *p = realloc(old, sz);
-    if (!p) {
-        fprintf(stderr, "realloc(%zu) failed: %s\n", sz, strerror(errno));         // stderr logging
-        exit(EXIT_FAILURE);
-    }
-    return p;
-}
-
-// -----------------------------------------------------------------------------
-// Worker tracking (ensures we can join all threads on shutdown)
-// -----------------------------------------------------------------------------
-
-static void add_worker(pthread_t tid) {
-    pthread_mutex_lock(&workers_lock);
-    if (worker_count == worker_capacity) {
-        size_t newcap = worker_capacity ? worker_capacity * 2 : 8;
-        pthread_t *newlist = xrealloc(worker_list, newcap * sizeof(pthread_t));
-        worker_list = newlist;
-        worker_capacity = newcap;
-    }
-    worker_list[worker_count++] = tid;
-    pthread_mutex_unlock(&workers_lock);
-}
-
-static void remove_worker(pthread_t tid) {
-    pthread_mutex_lock(&workers_lock);
-    for (size_t i = 0; i < worker_count; i++) {
-        if (pthread_equal(worker_list[i], tid)) {
-            worker_list[i] = worker_list[--worker_count];
-            break;
-        }
-    }
-    pthread_mutex_unlock(&workers_lock);
-}
-
-static void join_workers_and_cleanup(void) {
-    pthread_mutex_lock(&workers_lock);
-    for (size_t i = 0; i < worker_count; i++) {
-        int jrc = pthread_join(worker_list[i], NULL);
-        if (jrc != 0) {
-            fprintf(stderr, "pthread_join failed on worker %zu: %s\n", i, strerror(jrc));
-        }
-    }
-    free(worker_list);
-    worker_list = NULL;
-    worker_count = worker_capacity = 0;
-    pthread_mutex_unlock(&workers_lock);
 }
 
 // -----------------------------------------------------------------------------
@@ -247,6 +195,33 @@ static void *run_timer_thread(void *arg) {
 }
 
 // -----------------------------------------------------------------------------
+// Status report
+// -----------------------------------------------------------------------------
+
+// Writes one line reporting every zone, without touching any valve:
+//   OK STATUS V=1 ZONES=14 Z1=OFF:0 Z2=ON:28 ... Z14=OFF:0
+// Each zone is Zn=STATE:SECONDS, with seconds remaining rounded up. The README
+// documents this format and the Home Assistant integration parses it, so change
+// V if the meaning of an existing field ever changes.
+static void send_status(int cfd) {
+    char line[STATUS_BUF_SZ];
+    int len = snprintf(line, sizeof(line), "OK STATUS V=1 ZONES=%d", MAX_ZONE);
+
+    pthread_mutex_lock(&zone_lock);
+    int64_t now = now_ms();
+    for (int z = 1; z <= MAX_ZONE; z++) {
+        int64_t left_ms = zone_state[z] ? zone_end_ms[z] - now : 0;
+        long seconds = left_ms > 0 ? (long)((left_ms + 999) / 1000) : 0;
+        len += snprintf(line + len, sizeof(line) - len, " Z%d=%s:%ld",
+                        z, zone_state[z] ? "ON" : "OFF", seconds);
+    }
+    pthread_mutex_unlock(&zone_lock);
+
+    line[len++] = '\n';
+    write(cfd, line, len);
+}
+
+// -----------------------------------------------------------------------------
 // Command parser
 // -----------------------------------------------------------------------------
 
@@ -256,6 +231,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
     cmd[sizeof(cmd) - 1] = '\0';
 
     char *p_zone = NULL, *p_time = NULL, *p_token = NULL;
+    int want_status = 0;
     char *saveptr;
     char *token = strtok_r(cmd, " \t\n\r", &saveptr);
 
@@ -266,21 +242,29 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf) {
             p_time = token + 5;
         } else if (strncmp(token, "TOKEN=", 6) == 0) {
             p_token = token + 6;
+        } else if (strcmp(token, "STATUS") == 0) {
+            want_status = 1;
         }
         token = strtok_r(NULL, " \t\n\r", &saveptr);
-    }
-
-    if (!p_zone || !p_time) {
-        const char err[] = "ERR missing ZONE or TIME\n";
-        write(cfd, err, sizeof(err) - 1);
-        fprintf(stderr, "[%s] Rejected command (missing ZONE/TIME)\n", addrbuf);
-        return -1;
     }
 
     if (!p_token || strcmp(p_token, g_auth_token) != 0) {
         const char err[] = "ERR auth required\n";
         write(cfd, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Rejected command (bad/missing token)\n", addrbuf);
+        return -1;
+    }
+
+    // Not logged: this is polled, and would flood the journal
+    if (want_status) {
+        send_status(cfd);
+        return 0;
+    }
+
+    if (!p_zone || !p_time) {
+        const char err[] = "ERR missing ZONE or TIME\n";
+        write(cfd, err, sizeof(err) - 1);
+        fprintf(stderr, "[%s] Rejected command (missing ZONE/TIME)\n", addrbuf);
         return -1;
     }
 
@@ -402,7 +386,6 @@ static void *client_thread(void *arg) {
 
     close(cfd);
     sem_post(&client_slots);
-    remove_worker(pthread_self());
     return NULL;
 }
 
@@ -677,10 +660,9 @@ int main(void) {
             sem_post(&client_slots);
             continue;
         }
-        add_worker(tid);
+        pthread_detach(tid);                                                       // Frees its stack on exit
     }
 
     close(listen_fd);
-    join_workers_and_cleanup();
     return 0;
 }

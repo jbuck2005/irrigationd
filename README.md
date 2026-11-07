@@ -74,6 +74,33 @@ Turn off zone 1:
 irrigationctl "ZONE=1 TIME=0 TOKEN=your-long-random-token"
 ```
 
+### Status
+
+Report every zone without changing any valve:
+
+```bash
+irrigationctl "STATUS TOKEN=your-long-random-token"
+```
+
+The reply is one line, at most 182 bytes including the newline:
+
+```text
+OK STATUS V=1 ZONES=14 Z1=OFF:0 Z2=ON:28 Z3=OFF:0 ... Z14=OFF:0
+```
+
+Fields are separated by single spaces:
+
+- `OK STATUS` – a status reply. A rejected request gets the usual `ERR ...` line.
+- `V=1` – format version. It changes only if an existing field changes meaning.
+  New fields may be added to the end of the line, so ignore any you don't know.
+- `ZONES=14` – number of zones. Every zone from 1 to this number is listed, in order.
+- `Zn=STATE:SECONDS` – zone `n`. `STATE` is `ON` or `OFF`. `SECONDS` is the time
+  left in the current run, rounded up, and is always `0` when `OFF`.
+
+`STATE` is what the daemon last set, not a reading from the valve. If a valve
+fails to close, its zone stays `ON` with `SECONDS` at `1` or `0` while the daemon
+keeps retrying.
+
 ### Netcat (debugging)
 
 ```bash
