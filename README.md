@@ -41,6 +41,8 @@ IRRIGATIOND_BIND_ADDR=127.0.0.1
 - **IRRIGATIOND_TOKEN** – required token for all commands. Generate your own with `openssl rand -hex 16`; never use the example value.
 - **IRRIGATIOND_BIND_ADDR** – set to `127.0.0.1` (default) to only accept local
   connections, or `0.0.0.0` to allow remote access.
+- **IRRIGATIOND_TRUSTED_ADDR** – optional. One IPv4 address that the rate limit
+  does not apply to. See [Security Notes](#-security-notes).
 
 Reload systemd and enable the service:
 
@@ -150,5 +152,9 @@ Restart Home Assistant. Each zone will appear as a switch.
   further connection from it waits 1 second before its token is checked, and at
   most 2 may be open at once. A valid token is still accepted and clears the count.
   Clients with the right token are not rate limited.
+- That limit can refuse a valid Stop in one case: when the same IP is sending bad
+  tokens over several connections at once. To rule that out, set
+  `IRRIGATIOND_TRUSTED_ADDR` to the address of your Home Assistant host. Only use
+  an address that already has the token, because guesses from it are not limited.
 
 ---

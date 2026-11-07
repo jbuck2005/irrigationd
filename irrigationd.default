@@ -1,3 +1,6 @@
 # Required. Replace with your own value: openssl rand -hex 16
 IRRIGATIOND_TOKEN=CHANGE_ME_to_a_long_random_token
 IRRIGATIOND_BIND_ADDR=127.0.0.1
+# Optional. Exempts one IPv4 address from the failed-login rate limit. Set this to
+# the Home Assistant host, which holds the token anyway.
+#IRRIGATIOND_TRUSTED_ADDR=
