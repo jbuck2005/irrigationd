@@ -16,6 +16,8 @@
 #include <limits.h>                                                                // LONG_MAX for LRU eviction
 #include <signal.h>                                                                // SIGTERM/SIGINT/SIGPIPE handling
 
+#include <openssl/err.h>                                                           // ERR_clear_error
+#include "tls.h"                                                                   // TLS with the token as a pre-shared key
 #include "mcp23017.h"                                                              // MCP23017 driver interface
 
 // -----------------------------------------------------------------------------
@@ -32,12 +34,18 @@
 //   ZONE=n TIME=0 [TOKEN=secret]                                                   // Turn zone n OFF immediately
 //   STATUS [TOKEN=secret]                                                          // Report every zone, see send_status()
 //
+// Connections may be TLS 1.3 using the token as a pre-shared key (see tls.h),
+// in which case the handshake proves the token and TOKEN= is not needed, or
+// plain text with TOKEN=, unless IRRIGATIOND_PLAIN_TOKEN=no turns that off.
+//
 // Token authentication is mandatory: if IRRIGATIOND_TOKEN is not set in the
 // environment (via /etc/default/irrigationd), the daemon refuses to start.       // Prevents insecure deployments
 //
 // -----------------------------------------------------------------------------
 
+#ifndef SERVER_PORT
 #define SERVER_PORT     4242                                                       // TCP port to listen on
+#endif
 #define CMD_BUF_SZ      256                                                        // Max command length in bytes
 #define STATUS_BUF_SZ   (32 + 16 * MAX_ZONE)                                       // Header, plus up to 16 bytes per zone
 #define MAX_CLIENTS     16                                                         // Max concurrent client connections
@@ -68,6 +76,10 @@ static sem_t client_slots;
 static const char *g_auth_token = NULL;
 static struct in_addr g_trusted_addr;       // Exempt from the rate limit, if set
 static int g_have_trusted_addr = 0;
+static SSL_CTX *g_tls_ctx = NULL;           // Server side of TLS with the token as key
+static int g_plain_allowed = 1;             // IRRIGATIOND_PLAIN_TOKEN: accept TOKEN= in plain text
+static int64_t g_plain_warned_ms = 0;       // Last plain text warning, at most one an hour
+static pthread_mutex_t plain_warn_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // FIX: Data structures for rate limiting
 typedef struct {
@@ -239,7 +251,7 @@ static void *run_timer_thread(void *arg) {
 // Each zone is Zn=STATE:SECONDS, with seconds remaining rounded up. The README
 // documents this format and the Home Assistant integration parses it, so change
 // V if the meaning of an existing field ever changes.
-static void send_status(int cfd) {
+static void send_status(struct conn *conn) {
     char line[STATUS_BUF_SZ];
     int len = snprintf(line, sizeof(line), "OK STATUS V=1 ZONES=%d", MAX_ZONE);
 
@@ -254,7 +266,7 @@ static void send_status(int cfd) {
     pthread_mutex_unlock(&zone_lock);
 
     line[len++] = '\n';
-    write(cfd, line, len);
+    conn_write(conn, line, len);
 }
 
 // -----------------------------------------------------------------------------
@@ -282,8 +294,24 @@ static int token_matches(const char *given) {
     return diff == 0;
 }
 
+// A plain text login works, but anyone watching the network saw the token, so
+// say so. At most once an hour: Home Assistant polls every 15 seconds.
+static void warn_plain_token(const char *addrbuf) {
+    pthread_mutex_lock(&plain_warn_lock);
+    int64_t now = now_ms();
+    int warn = g_plain_warned_ms == 0 || now - g_plain_warned_ms >= 3600 * 1000;
+    if (warn) {
+        g_plain_warned_ms = now;
+    }
+    pthread_mutex_unlock(&plain_warn_lock);
+    if (warn) {
+        fprintf(stderr, "[%s] WARNING: token received in plain text. Update the client to use TLS, "
+                        "then set IRRIGATIOND_PLAIN_TOKEN=no\n", addrbuf);
+    }
+}
+
 // Sets *authenticated once the token has been accepted, whatever happens after.
-static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
+static int parse_command(struct conn *conn, const char *cmd_const, const char *addrbuf,
                          int over_limit, int *authenticated) {
     char cmd[CMD_BUF_SZ];
     strncpy(cmd, cmd_const, sizeof(cmd));
@@ -307,28 +335,33 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
         token = strtok_r(NULL, " \t\n\r", &saveptr);
     }
 
-    if (!p_token || !token_matches(p_token)) {
+    // Over TLS the handshake has already proved the token, so TOKEN= is ignored
+    int tls = conn->ssl != NULL;
+    if (!tls && (!p_token || !token_matches(p_token))) {
         const char auth_err[] = "ERR auth required\n";
         const char limit_err[] = "ERR rate limit exceeded\n";
         if (over_limit) {
-            write(cfd, limit_err, sizeof(limit_err) - 1);
+            conn_write(conn, limit_err, sizeof(limit_err) - 1);
         } else {
-            write(cfd, auth_err, sizeof(auth_err) - 1);
+            conn_write(conn, auth_err, sizeof(auth_err) - 1);
         }
         fprintf(stderr, "[%s] Rejected command (bad/missing token)\n", addrbuf);
         return -1;
     }
     *authenticated = 1;
+    if (!tls) {
+        warn_plain_token(addrbuf);
+    }
 
     // Not logged: this is polled, and would flood the journal
     if (want_status) {
-        send_status(cfd);
+        send_status(conn);
         return 0;
     }
 
     if (!p_zone || !p_time) {
         const char err[] = "ERR missing ZONE or TIME\n";
-        write(cfd, err, sizeof(err) - 1);
+        conn_write(conn, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Rejected command (missing ZONE/TIME)\n", addrbuf);
         return -1;
     }
@@ -336,7 +369,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
     long zone_l;
     if (parse_number(p_zone, &zone_l) != 0) {
         const char err[] = "ERR invalid ZONE format\n";
-        write(cfd, err, sizeof(err) - 1);
+        conn_write(conn, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Rejected command (invalid zone format)\n", addrbuf);
         return -1;
     }
@@ -344,7 +377,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
     long duration_l;
     if (parse_number(p_time, &duration_l) != 0) {
         const char err[] = "ERR invalid TIME format\n";
-        write(cfd, err, sizeof(err) - 1);
+        conn_write(conn, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Rejected command (invalid time format)\n", addrbuf);
         return -1;
     }
@@ -352,7 +385,7 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
     // Range check before narrowing, so a huge value cannot wrap into a valid one
     if (zone_l < 1 || zone_l > MAX_ZONE || duration_l < 0 || duration_l > MAX_ZONE_RUNTIME) {
         const char err[] = "ERR invalid ZONE or TIME\n";
-        write(cfd, err, sizeof(err) - 1);
+        conn_write(conn, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Rejected command (invalid zone/time)\n", addrbuf);
         return -1;
     }
@@ -367,12 +400,12 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
         pthread_mutex_unlock(&zone_lock);
         if (rc != 0) {
             const char err[] = "ERR valve write failed\n";
-            write(cfd, err, sizeof(err) - 1);
+            conn_write(conn, err, sizeof(err) - 1);
             fprintf(stderr, "[%s] Zone %d stop failed, retrying\n", addrbuf, zone);
             return -1;
         }
         const char ok[] = "OK\n";
-        write(cfd, ok, sizeof(ok) - 1);
+        conn_write(conn, ok, sizeof(ok) - 1);
         fprintf(stderr, "[%s] Zone %d OFF (immediate stop)\n", addrbuf, zone);
         return 0;
     }
@@ -380,19 +413,19 @@ static int parse_command(int cfd, const char *cmd_const, const char *addrbuf,
     int start_rc = start_zone(zone, duration);
     if (start_rc == ZONE_AT_LIMIT) {
         const char err[] = "ERR zone at maximum runtime\n";
-        write(cfd, err, sizeof(err) - 1);
+        conn_write(conn, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Zone %d start refused: at maximum runtime\n", addrbuf, zone);
         return -1;
     }
     if (start_rc != 0) {
         const char err[] = "ERR valve write failed\n";
-        write(cfd, err, sizeof(err) - 1);
+        conn_write(conn, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Zone %d start failed\n", addrbuf, zone);
         return -1;
     }
 
     const char ok[] = "OK\n";
-    write(cfd, ok, sizeof(ok) - 1);
+    conn_write(conn, ok, sizeof(ok) - 1);
     fprintf(stderr, "[%s] Zone %d ON for %d seconds\n", addrbuf, zone, duration);
     return 0;
 }
@@ -411,11 +444,11 @@ static void format_client_addr(const struct sockaddr_in *cli, char *buf, size_t 
     }
 }
 
-static ssize_t read_line(int fd, char *buf, size_t sz) {
+static ssize_t read_line(struct conn *conn, char *buf, size_t sz) {
     size_t i = 0;
     while (i < sz - 1) {
         char c;
-        ssize_t rc = read(fd, &c, 1);
+        ssize_t rc = conn_read(conn, &c, 1);
         if (rc == 1) {
             if (c == '\n') break;
             if (c != '\r') buf[i++] = c;
@@ -527,6 +560,38 @@ struct client_arg {
     int over_limit;
 };
 
+// Reads one command line and acts on it.
+static void handle_line(struct conn *conn, const char *addrbuf, int over_limit, int *authenticated) {
+    char buf[CMD_BUF_SZ];
+    ssize_t n = read_line(conn, buf, sizeof(buf));
+    if (n > 0) {
+        parse_command(conn, buf, addrbuf, over_limit, authenticated);
+    } else if (n < 0) {
+        fprintf(stderr, "[%s] read from client failed: %s\n", addrbuf, strerror(errno));
+    }
+}
+
+// A finished handshake proves the client holds the token: only then is the
+// command read. A failed one counts as a failed login for the rate limit.
+static void handle_tls(struct conn *conn, const char *addrbuf, int over_limit, int *authenticated) {
+    conn->ssl = SSL_new(g_tls_ctx);
+    if (conn->ssl == NULL || SSL_set_fd(conn->ssl, conn->fd) != 1) {
+        fprintf(stderr, "[%s] TLS setup failed\n", addrbuf);
+        conn_shutdown(conn);
+        return;
+    }
+    if (SSL_accept(conn->ssl) != 1) {
+        ERR_clear_error();
+        SSL_free(conn->ssl);
+        conn->ssl = NULL;
+        fprintf(stderr, "[%s] Rejected TLS connection (wrong token or not a client)\n", addrbuf);
+        return;
+    }
+    *authenticated = 1;
+    handle_line(conn, addrbuf, over_limit, authenticated);
+    conn_shutdown(conn);
+}
+
 static void *client_thread(void *arg) {
     struct client_arg *carg = arg;
     int cfd = carg->cfd;
@@ -542,15 +607,32 @@ static void *client_thread(void *arg) {
     tv.tv_usec = 0;
     (void)setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    char buf[CMD_BUF_SZ];
+    struct conn conn = { .fd = cfd, .ssl = NULL };
     int authenticated = 0;
-    ssize_t n = read_line(cfd, buf, sizeof(buf));
-    if (n > 0) {
+
+    // Look at the first byte without taking it: TLS always starts with a
+    // handshake record, and a plain text command never does
+    unsigned char first;
+    ssize_t peeked;
+    do {
+        peeked = recv(cfd, &first, 1, MSG_PEEK);
+    } while (peeked < 0 && errno == EINTR);
+
+    if (peeked == 1) {
+        // Paces guessing, whichever way the guess arrives
         if (over_limit) {
             sleep(RATE_LIMIT_DELAY);
         }
-        parse_command(cfd, buf, addrbuf, over_limit, &authenticated);
-    } else if (n < 0) {
+        if (first == TLS_RECORD_HANDSHAKE) {
+            handle_tls(&conn, addrbuf, over_limit, &authenticated);
+        } else if (!g_plain_allowed) {
+            const char err[] = "ERR plain text disabled, use TLS\n";
+            conn_write(&conn, err, sizeof(err) - 1);
+            fprintf(stderr, "[%s] Rejected plain text connection (IRRIGATIOND_PLAIN_TOKEN=no)\n", addrbuf);
+        } else {
+            handle_line(&conn, addrbuf, over_limit, &authenticated);
+        }
+    } else if (peeked < 0) {
         fprintf(stderr, "[%s] read from client failed: %s\n", addrbuf, strerror(errno));
     }
 
@@ -699,6 +781,27 @@ int main(void) {
         fprintf(stderr, "IRRIGATIOND_TOKEN is still an example value, refusing to start. "
                         "Set your own in /etc/default/irrigationd: openssl rand -hex 16\n");
         exit(EXIT_FAILURE);
+    }
+
+    g_tls_ctx = tls_server_ctx(g_auth_token);
+    if (g_tls_ctx == NULL) {
+        fprintf(stderr, "ERROR: Failed to set up TLS\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Missing means yes, so an existing install keeps working with clients
+    // that don't speak TLS yet. Anything but yes or no turns plain text off.
+    const char *plain_env = getenv("IRRIGATIOND_PLAIN_TOKEN");
+    if (plain_env == NULL || plain_env[0] == '\0' || strcmp(plain_env, "yes") == 0) {
+        g_plain_allowed = 1;
+        fprintf(stderr, "Accepting TLS, and plain text logins with TOKEN= "
+                        "(set IRRIGATIOND_PLAIN_TOKEN=no once every client uses TLS)\n");
+    } else {
+        g_plain_allowed = 0;
+        if (strcmp(plain_env, "no") != 0) {
+            fprintf(stderr, "Invalid IRRIGATIOND_PLAIN_TOKEN '%s', treating it as no\n", plain_env);
+        }
+        fprintf(stderr, "Accepting TLS only\n");
     }
 
     // Runs depend on these threads, so refuse to start without them
