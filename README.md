@@ -39,14 +39,29 @@ IRRIGATIOND_TOKEN=your-long-random-token
 IRRIGATIOND_BIND_ADDR=127.0.0.1
 ```
 
-- **IRRIGATIOND_TOKEN** – required token for all commands. A new install has this
-  line commented out, and the daemon refuses to start until you set it. Generate
-  your own with `openssl rand -hex 16`. The daemon also refuses to start with an
-  example value, including the placeholder from older default configs.
+- **IRRIGATIOND_TOKEN** – required token for all commands. `make install`
+  generates a random one, saves it here and prints it in a banner: copy it into
+  the Home Assistant integration. It also does this for an existing file whose
+  token is unset or an example value, but never changes a token you have set.
+  The daemon refuses to start without a token, or with an example value.
 - **IRRIGATIOND_BIND_ADDR** – set to `127.0.0.1` (default) to only accept local
   connections, or `0.0.0.0` to allow remote access.
 - **IRRIGATIOND_TRUSTED_ADDR** – optional. One IPv4 address that the rate limit
   does not apply to. See [Security Notes](#-security-notes).
+
+To show the token again:
+
+```bash
+sudo sed -n 's/^IRRIGATIOND_TOKEN=//p' /etc/default/irrigationd
+```
+
+To replace it with a new random one:
+
+```bash
+sudo sed -i -E "s|^#?[[:space:]]*IRRIGATIOND_TOKEN=.*|IRRIGATIOND_TOKEN=$(openssl rand -hex 16)|" /etc/default/irrigationd
+```
+
+Then restart the daemon and enter the new token in Home Assistant.
 
 Reload systemd and enable the service:
 
