@@ -45,12 +45,7 @@ install: all
 	install -d $(DESTDIR)/etc/default
 	echo "Consider running: sudo systemctl daemon-reload"
 	echo ""
-	@if [ ! -f $(DESTDIR)/etc/default/irrigationd ]; then \
-		install -m 600 irrigationd.default $(DESTDIR)/etc/default/irrigationd; \
-		echo "Installed default /etc/default/irrigationd"; \
-	else \
-		echo "Skipping /etc/default/irrigationd (already exists)"; \
-	fi
+	@DESTDIR="$(DESTDIR)" sh scripts/install-config.sh
 
 # Development target: run irrigationd in foreground
 dev: $(BIN_DIR)/irrigationd

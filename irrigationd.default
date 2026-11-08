@@ -1,5 +1,6 @@
-# Required. The daemon refuses to start until this is set. Uncomment the line
-# below and add your own value, which you can generate with: openssl rand -hex 16
+# Required. The daemon refuses to start until this is set. "make install" sets
+# it to a new random value. To set it yourself, uncomment the line below and add
+# your own value, which you can generate with: openssl rand -hex 16
 #IRRIGATIOND_TOKEN=
 IRRIGATIOND_BIND_ADDR=127.0.0.1
 # Optional. Exempts one IPv4 address from the failed-login rate limit. Set this to
