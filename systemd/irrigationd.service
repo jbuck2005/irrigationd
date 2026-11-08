@@ -15,7 +15,6 @@ Group=irrigation
 # Security hardening
 NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectSystem=full
 ProtectHome=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
@@ -24,6 +23,31 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
+
+# Further sandboxing. The daemon only needs TCP, the I2C bus and its stderr.
+ProtectSystem=strict
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+DevicePolicy=closed
+DeviceAllow=/dev/i2c-1 rw
+UMask=0077
+
+# Optional: let only Home Assistant and this machine connect, whatever the
+# firewall says. Put your Home Assistant address in a drop-in rather than
+# here, so updates don't overwrite it:
+#   sudo systemctl edit irrigationd
+#   [Service]
+#   IPAddressDeny=any
+#   IPAddressAllow=localhost 192.0.2.10
 
 # Environment configuration (token + bind address)
 # This file is REQUIRED. Service will fail if missing.
