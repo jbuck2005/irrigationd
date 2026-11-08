@@ -109,6 +109,10 @@ int main(int argc, char *argv[]) {
     const char *env_token = getenv("IRRIGATION_TOKEN");
     if (env_token && env_token[0] != '\0') {
         token = env_token;
+    } else if (token != NULL) {
+        // Other users can see it in ps, and it stays in shell history
+        fprintf(stderr, "Warning: a token on the command line can be seen by other users and stays in "
+                        "your shell history. Set IRRIGATION_TOKEN instead.\n");
     }
     if (token == NULL || token[0] == '\0') {
         fprintf(stderr, "No token: set IRRIGATION_TOKEN, or add TOKEN=... to the command\n");
@@ -140,8 +144,8 @@ int main(int argc, char *argv[]) {
         }
         if (SSL_connect(conn.ssl) != 1) {
             ERR_clear_error();
-            fprintf(stderr, "TLS handshake failed: the token is wrong, or irrigationd is too old "
-                            "for TLS (IRRIGATION_PLAIN=1 sends it in plain text)\n");
+            fprintf(stderr, "TLS handshake failed: the token is wrong, the server isn't irrigationd, "
+                            "or irrigationd is too old for TLS (IRRIGATION_PLAIN=1 sends it in plain text)\n");
             SSL_free(conn.ssl);
             close(sockfd);
             exit(EXIT_FAILURE);
