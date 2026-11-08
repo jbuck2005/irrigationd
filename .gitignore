@@ -5,6 +5,7 @@
 irrigation
 irrigationctl
 irrigationd
+irrigationd-test
 
 # Backup files
 *~
