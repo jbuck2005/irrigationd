@@ -243,5 +243,10 @@ the token in plain text.
   tokens over several connections at once. To rule that out, set
   `IRRIGATIOND_TRUSTED_ADDR` to the address of your Home Assistant host. Only use
   an address that already has the token, because guesses from it are not limited.
+- Each connection gets 5 seconds for its handshake, command and reply, then it is
+  closed. At most 16 connections are open at once, at most 4 from one address,
+  and the last free slot is kept for `IRRIGATIOND_TRUSTED_ADDR`. Further
+  connections get `ERR server busy` straight away. So a device on the network
+  without the token can't hold connections open to shut Home Assistant out.
 
 ---

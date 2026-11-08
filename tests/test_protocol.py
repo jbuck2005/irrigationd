@@ -204,9 +204,75 @@ def test_token_never_sent():
     check("the key never appears on the wire", psk_key(TOKEN) not in received, "key found")
 
 
+def slow_client(source):
+    """A client without the token that sends one byte now and then, to hold a slot."""
+    sock = socket.create_connection((HOST, PORT), timeout=10, source_address=(source, 0))
+    sock.sendall(b"\x16")
+    return sock
+
+
+def closed_by_daemon(sock):
+    """True once the daemon has closed the connection, reading anything it sent first."""
+    sock.settimeout(1)
+    try:
+        while True:
+            if sock.recv(100) == b"":
+                return True
+    except OSError:
+        return False
+
+
+def test_slow_clients_cant_lock_out_the_trusted_host():
+    """Connections without the token can't hold every slot, or hold one for long."""
+    daemon = Daemon(IRRIGATIOND_TRUSTED_ADDR=HOST)
+    socks = []
+    try:
+        # One address gets four connections, and a fifth is turned away at once
+        for _ in range(4):
+            socks.append(slow_client("127.0.0.3"))
+        with socket.create_connection((HOST, PORT), timeout=5, source_address=("127.0.0.3", 0)) as extra:
+            reply = extra.recv(100).decode().strip()
+        check("a fifth connection from one address is refused", reply == "ERR server busy", reply)
+
+        # More addresses try for every slot; one is always kept for the trusted host
+        for i in range(12):
+            try:
+                socks.append(slow_client(f"127.0.0.{4 + i % 3}"))
+            except OSError:
+                pass
+        time.sleep(0.5)
+        started = time.monotonic()
+        rc, out, err = ctl("STATUS", token=TOKEN)
+        check("the trusted host gets through while others hold slots",
+              rc == 0 and "OK STATUS" in out and time.monotonic() - started < 3, out + err)
+
+        # Trickling bytes doesn't keep a connection open past its deadline
+        for _ in range(4):
+            time.sleep(2)
+            for sock in socks:
+                try:
+                    sock.sendall(b"\x03")
+                except OSError:
+                    pass
+        cut_off = sum(closed_by_daemon(sock) for sock in socks)
+        check("slow connections are cut off at their deadline", cut_off == len(socks),
+              f"{cut_off} of {len(socks)} closed")
+
+        rc, out, err = ctl("STATUS", token=TOKEN)
+        check("commands work again once the slow clients are cut off", rc == 0 and "OK STATUS" in out,
+              out + err)
+        log = daemon.output()
+        check("refused connections are logged",
+              "too many connections from this address" in log and "all client slots in use" in log, log[-500:])
+    finally:
+        for sock in socks:
+            sock.close()
+        daemon.stop()
+
 test_tls_and_plain_allowed()
 test_plain_disabled()
 test_token_never_sent()
+test_slow_clients_cant_lock_out_the_trusted_host()
 
 print()
 if failures:

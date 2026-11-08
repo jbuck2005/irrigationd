@@ -7,7 +7,6 @@
 #include <sys/socket.h>                                                            // Sockets API
 #include <netinet/in.h>                                                            // sockaddr_in, htons, INADDR_ANY
 #include <arpa/inet.h>                                                             // inet_ntop, inet_addr, inet_pton
-#include <semaphore.h>                                                             // POSIX semaphores
 #include <sys/types.h>                                                             // Basic system data types
 #include <time.h>                                                                  // Sleep handling
 #include <sys/time.h>                                                              // struct timeval for timeouts
@@ -49,6 +48,8 @@
 #define CMD_BUF_SZ      256                                                        // Max command length in bytes
 #define STATUS_BUF_SZ   (32 + 16 * MAX_ZONE)                                       // Header, plus up to 16 bytes per zone
 #define MAX_CLIENTS     16                                                         // Max concurrent client connections
+#define MAX_CLIENTS_PER_IP 4                                                       // Max concurrent connections from one address
+#define CONN_DEADLINE_MS 5000                                                      // A whole connection: handshake, command and reply
 #define MAX_ZONE_RUNTIME 7200                                                      // Safety: max zone runtime = 2 hours
 #define WATCHDOG_INTERVAL 30                                                       // Watchdog check interval in seconds
 #define ZONE_COOLDOWN_SECS 600                                                     // Wait after a valve reaches MAX_ZONE_RUNTIME
@@ -72,7 +73,17 @@ static int64_t zone_end_ms[MAX_ZONE+1];     // When the current run ends (0 = no
 static int64_t zone_reopen_ms[MAX_ZONE+1];  // Runs refused until this time (0 = none)
 static pthread_mutex_t zone_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t zone_end_changed;     // Wakes the run timer when a deadline changes
-static sem_t client_slots;
+// Every open client connection, so a slow one can be cut off at its deadline
+// and no address can take every slot. One slot is kept for the trusted address.
+typedef struct {
+    int in_use;
+    int fd;
+    uint32_t ip_addr;                   // Network byte order
+    int64_t deadline_ms;                // Monotonic; past it, the socket is shut down
+} ClientSlot;
+
+static ClientSlot client_slots[MAX_CLIENTS];
+static pthread_mutex_t client_slots_lock = PTHREAD_MUTEX_INITIALIZER;
 static const char *g_auth_token = NULL;
 static struct in_addr g_trusted_addr;       // Exempt from the rate limit, if set
 static int g_have_trusted_addr = 0;
@@ -558,6 +569,7 @@ struct client_arg {
     int cfd;
     struct sockaddr_in cli;
     int over_limit;
+    int slot;
 };
 
 // Reads one command line and acts on it.
@@ -592,11 +604,74 @@ static void handle_tls(struct conn *conn, const char *addrbuf, int over_limit, i
     conn_shutdown(conn);
 }
 
+enum slot_result { SLOT_OK, SLOT_BUSY, SLOT_IP_BUSY };
+
+// Takes a slot for a new connection, and puts its index in *index.
+static enum slot_result client_slot_take(int fd, struct in_addr ip, int trusted, int *index) {
+    pthread_mutex_lock(&client_slots_lock);
+    int used = 0, from_ip = 0, free_idx = -1;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (client_slots[i].in_use) {
+            used++;
+            if (client_slots[i].ip_addr == ip.s_addr) from_ip++;
+        } else if (free_idx < 0) {
+            free_idx = i;
+        }
+    }
+
+    enum slot_result result = SLOT_OK;
+    if (free_idx < 0) {
+        result = SLOT_BUSY;
+    } else if (!trusted && used >= MAX_CLIENTS - 1) {
+        result = SLOT_BUSY;                                                        // The last slot is the trusted address's
+    } else if (!trusted && from_ip >= MAX_CLIENTS_PER_IP) {
+        result = SLOT_IP_BUSY;
+    } else {
+        client_slots[free_idx] = (ClientSlot){
+            .in_use = 1, .fd = fd, .ip_addr = ip.s_addr,
+            .deadline_ms = now_ms() + CONN_DEADLINE_MS,
+        };
+        *index = free_idx;
+    }
+    pthread_mutex_unlock(&client_slots_lock);
+    return result;
+}
+
+// Releases a slot. Called before the fd is closed, so the reaper can never
+// shut down a socket number that has since been reused.
+static void client_slot_release(int index) {
+    pthread_mutex_lock(&client_slots_lock);
+    client_slots[index].in_use = 0;
+    client_slots[index].fd = -1;
+    pthread_mutex_unlock(&client_slots_lock);
+}
+
+// Cuts off connections past their deadline. Shutting the socket down makes the
+// client thread's blocked read return, so it finishes and frees its slot. This
+// stops a client that sends a byte every few seconds from holding a slot.
+static void *reaper_thread(void *arg) {
+    (void)arg;
+    while (1) {
+        sleep(1);
+        pthread_mutex_lock(&client_slots_lock);
+        int64_t now = now_ms();
+        for (int i = 0; i < MAX_CLIENTS; i++) {
+            if (client_slots[i].in_use && client_slots[i].fd >= 0 && now > client_slots[i].deadline_ms) {
+                shutdown(client_slots[i].fd, SHUT_RDWR);
+                client_slots[i].fd = -1;                                           // Once is enough
+            }
+        }
+        pthread_mutex_unlock(&client_slots_lock);
+    }
+    return NULL;
+}
+
 static void *client_thread(void *arg) {
     struct client_arg *carg = arg;
     int cfd = carg->cfd;
     struct sockaddr_in cli = carg->cli;
     int over_limit = carg->over_limit;
+    int slot = carg->slot;
     free(carg);
 
     char addrbuf[64];
@@ -636,9 +711,9 @@ static void *client_thread(void *arg) {
         fprintf(stderr, "[%s] read from client failed: %s\n", addrbuf, strerror(errno));
     }
 
+    client_slot_release(slot);
     close(cfd);
     rate_limit_finish(cli.sin_addr, over_limit, authenticated);
-    sem_post(&client_slots);
     return NULL;
 }
 
@@ -825,7 +900,14 @@ int main(void) {
         fprintf(stderr, "Watchdog thread started successfully\n");
     }
 
-    sem_init(&client_slots, 0, MAX_CLIENTS);
+    pthread_t reaper_tid;
+    int rprc = pthread_create(&reaper_tid, NULL, reaper_thread, NULL);
+    if (rprc != 0) {
+        // Without it a slow client could hold a slot for good
+        fprintf(stderr, "ERROR: Failed to start connection reaper thread: %s\n", strerror(rprc));
+        exit(EXIT_FAILURE);
+    }
+    pthread_detach(reaper_tid);
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
@@ -879,15 +961,21 @@ int main(void) {
             format_client_addr(&cli, addrbuf, sizeof(addrbuf));
             fprintf(stderr, "[%s] Connection rejected: rate limit exceeded\n", addrbuf);
             const char err[] = "ERR rate limit exceeded\n";
-            write(cfd, err, sizeof(err)-1);
+            (void)!write(cfd, err, sizeof(err)-1);
             close(cfd);
             continue;
         }
 
-        if (sem_wait(&client_slots) != 0) {
-            fprintf(stderr, "Failed to acquire client slot: %s\n", strerror(errno));
+        // Never waits for a slot: a blocked accept loop would shut out everyone
+        int slot = -1;
+        enum slot_result taken = client_slot_take(cfd, cli.sin_addr, trusted, &slot);
+        if (taken != SLOT_OK) {
+            char addrbuf[64];
+            format_client_addr(&cli, addrbuf, sizeof(addrbuf));
+            fprintf(stderr, "[%s] Connection rejected: %s\n", addrbuf,
+                    taken == SLOT_IP_BUSY ? "too many connections from this address" : "all client slots in use");
             const char err[] = "ERR server busy\n";
-            write(cfd, err, sizeof(err) - 1);
+            (void)!write(cfd, err, sizeof(err) - 1);
             close(cfd);
             rate_limit_finish(cli.sin_addr, rate == RATE_OVER_LIMIT, 0);
             continue;
@@ -897,13 +985,14 @@ int main(void) {
         carg->cfd = cfd;
         carg->cli = cli;
         carg->over_limit = rate == RATE_OVER_LIMIT;
+        carg->slot = slot;
 
         pthread_t tid;
         if (pthread_create(&tid, NULL, client_thread, carg) != 0) {
             fprintf(stderr, "pthread_create failed: %s\n", strerror(errno));
+            client_slot_release(slot);
             close(cfd);
             free(carg);
-            sem_post(&client_slots);
             rate_limit_finish(cli.sin_addr, rate == RATE_OVER_LIMIT, 0);
             continue;
         }
