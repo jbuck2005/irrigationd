@@ -52,7 +52,7 @@ $(OBJ_DIR) $(BIN_DIR):
 # Install target
 install: all
 	install -d $(DESTDIR)/usr/local/bin
-	install -m 755 $(BIN_DIR)/* $(DESTDIR)/usr/local/bin/
+	install -m 755 $(BIN_DIR)/irrigationctl $(BIN_DIR)/irrigationd $(DESTDIR)/usr/local/bin/
 	install -d $(DESTDIR)/etc/systemd/system
 	install -m 644 $(SYSTEMD_DIR)/irrigationd.service $(DESTDIR)/etc/systemd/system/
 	install -d $(DESTDIR)/etc/default
