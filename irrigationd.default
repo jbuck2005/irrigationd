@@ -1,15 +1,20 @@
 # Required. The daemon refuses to start until this is set. "make install" sets
 # it to a new random value. To set it yourself, uncomment the line below and add
 # your own value, which you can generate with: openssl rand -hex 16
+# A token shorter than 16 characters is warned about at startup.
 #IRRIGATIOND_TOKEN=
+# IPv4 address to listen on, port 4242. 127.0.0.1 accepts only this machine.
+# Use 0.0.0.0, or one of this machine's addresses, for Home Assistant elsewhere.
 IRRIGATIOND_BIND_ADDR=127.0.0.1
 # Recommended when Home Assistant runs on another machine. Exempts one IPv4
-# address from the failed-login rate limit and keeps connection slots for it.
+# address from the failed-login rate limit and the per-address connection
+# limit, and lets it use the reserved connection slots.
 # Set this to the Home Assistant host, which holds the token anyway.
 #IRRIGATIOND_TRUSTED_ADDR=
 # Plain text logins, where the token crosses the network readable, are off.
 # Clients connect with TLS, using the token as the key, so it is never sent.
 # Set this to yes only for a client that doesn't speak TLS yet, such as Home
 # Assistant older than 2025.2 or irrigation-ha older than the TLS release.
-# When missing, as in configs from before TLS, it means yes.
+# When missing, as in configs from before TLS, it means yes. Any value other
+# than yes or no means no.
 IRRIGATIOND_PLAIN_TOKEN=no

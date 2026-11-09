@@ -5,6 +5,8 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/irrigationd
+# irrigationd exits with a failure after SIGHUP, SIGQUIT or a valve that
+# would not close, so systemd starts it again. SIGTERM exits cleanly.
 Restart=on-failure
 RestartSec=5s
 
@@ -49,7 +51,7 @@ UMask=0077
 #   IPAddressDeny=any
 #   IPAddressAllow=localhost 192.0.2.10
 
-# Environment configuration (token + bind address)
+# Settings: token, bind address, trusted address and plain text logins.
 # This file is REQUIRED. Service will fail if missing.
 EnvironmentFile=/etc/default/irrigationd
 

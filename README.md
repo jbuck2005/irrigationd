@@ -24,16 +24,46 @@ make
 sudo make install
 ```
 
-`make test` runs the protocol tests on any Linux machine, with a fake valve
-driver and no hardware.
-
 This installs:
 
 - `/usr/local/bin/irrigationd` – the daemon
 - `/usr/local/bin/irrigationctl` – the CLI tool
 - `/etc/systemd/system/irrigationd.service` – systemd unit
-- `/etc/default/irrigationd` – configuration file (token and bind address)
+- `/etc/default/irrigationd` – configuration file, see Configuration below
 - an `irrigation` system user in the `i2c` group, which the service runs as
+
+`make install` also:
+
+- installs `/etc/default/irrigationd` only if it isn't there yet, and sets it to
+  mode 600 either way, since it holds the token
+- generates a token if none is set (see Configuration)
+- prints a reminder on every install until `IRRIGATIOND_TRUSTED_ADDR` is set
+- warns if there is no `i2c` group: enable I2C with `sudo raspi-config` and run
+  it again
+- runs `systemctl daemon-reload`, so systemd sees an updated unit file
+
+It does not restart a running daemon. After an update, run
+`sudo systemctl restart irrigationd`.
+
+With `DESTDIR` set, such as for a package, it copies the files there and skips
+creating the user and reloading systemd.
+
+### Make targets
+
+- `make` (or `make all`) – builds `bin/irrigationd` and `bin/irrigationctl`
+- `make test` – runs the protocol tests on any Linux machine, with a fake valve
+  driver on port 14242 and no hardware. Needs `python3`
+- `sudo make install` – installs, as above
+- `make dev` – runs `bin/irrigationd` in the foreground on `127.0.0.1` with the
+  token `devtoken`, which it warns is too short. It uses the real I2C bus
+- `make clean` – removes `build/` and `bin/`
+
+### Hardware
+
+irrigationd drives an MCP23017 at address `0x20` on `/dev/i2c-1`. Both are fixed
+in the code. It has 14 zones: zones 1 to 8 are pins GPA0 to GPA7, and zones 9 to
+14 are GPB0 to GPB5. A pin is high while its valve is open. All 16 pins are set
+as outputs and start low. irrigationd refuses to start if it can't set up the chip.
 
 ---
 
@@ -50,17 +80,27 @@ IRRIGATIOND_BIND_ADDR=127.0.0.1
   generates a random one, saves it here and prints it in a banner: copy it into
   the Home Assistant integration. It also does this for an existing file whose
   token is unset or an example value, but never changes a token you have set.
-  The daemon refuses to start without a token, or with an example value.
-- **IRRIGATIOND_BIND_ADDR** – set to `127.0.0.1` (default) to only accept local
-  connections, or `0.0.0.0` to allow remote access.
+  The daemon refuses to start without a token, or with an example value. It
+  logs a warning at startup for a token shorter than 16 characters, the minimum
+  Home Assistant accepts for a new token, since a short one could be guessed
+  offline from one recorded TLS handshake. It still starts.
+- **IRRIGATIOND_BIND_ADDR** – the IPv4 address to listen on. `127.0.0.1` (the
+  default, also used when it's missing or not a valid address) only accepts
+  local connections. Use `0.0.0.0`, or one of this machine's addresses, to allow
+  remote access. The port is always 4242.
 - **IRRIGATIOND_PLAIN_TOKEN** – `no` (fresh installs) accepts only TLS, so the
-  token never crosses the network. `yes` also accepts the older plain text
+  token never crosses the network, and a plain text command gets
+  `ERR plain text disabled, use TLS`. `yes` also accepts the older plain text
   `TOKEN=` lines, for clients that don't speak TLS yet, and logs a warning at
-  most once an hour while they are used. When missing, as in a config file from
-  before TLS, it means `yes`. See [Encryption](#-encryption).
+  most once an hour while they are used. When missing or empty, as in a config
+  file from before TLS, it means `yes`. Any other value means `no`, with a
+  warning at startup. See [Encryption](#-encryption).
 - **IRRIGATIOND_TRUSTED_ADDR** – recommended when Home Assistant runs on another
-  machine. One IPv4 address that the rate limit does not apply to, and that always
-  gets one of the reserved connection slots. See [Security Notes](#-security-notes).
+  machine. One IPv4 address that the rate limit and the limit of 4 connections
+  per address don't apply to, and that can always use the reserved connection
+  slots. An invalid value is logged and ignored. While it isn't set and
+  `IRRIGATIOND_BIND_ADDR` is set to anything but `127.0.0.1`, irrigationd logs a
+  reminder at startup. See [Security Notes](#-security-notes).
 
 To show the token again:
 
@@ -99,9 +139,15 @@ sudo journalctl -u irrigationd -f
 or from a `TOKEN=` field in the command, which it then leaves out of what it
 sends. Prefer `IRRIGATION_TOKEN`: a token on the command line can be seen by
 other users in `ps` and stays in your shell history, so `irrigationctl` warns
-about it. `IRRIGATION_HOST` and `IRRIGATION_PORT` pick the daemon (default
+about it. If both are given, `IRRIGATION_TOKEN` is used. `IRRIGATION_HOST` (an
+IPv4 address, not a hostname) and `IRRIGATION_PORT` pick the daemon (default
 `127.0.0.1:4242`). It refuses a server that doesn't prove it has the token,
 such as one offering a certificate instead.
+
+It prints the daemon's reply as `Response: OK` or `Response: ERR ...`. It exits
+with 0 whenever a reply arrives, including an `ERR` reply, so check the text
+rather than the exit status. It exits with 1 when it gets no reply, such as when
+the connection or the TLS handshake fails, and says why.
 
 Turn on zone 1 for 30 seconds:
 
@@ -135,6 +181,10 @@ kept across a daemon restart.
 A run that ends by itself before 2 hours, or is stopped, starts no wait, so this
 limits one continuous open, not total watering in a day.
 
+The limit applies to every zone, including one used as a master valve or pump.
+A master zone kept open across several zones in a row counts as one continuous
+open, so after 2 hours it closes and is refused for 10 minutes.
+
 ### Status
 
 Report every zone without changing any valve:
@@ -161,6 +211,44 @@ Fields are separated by single spaces:
 `STATE` is what the daemon last set, not a reading from the valve. If a valve
 fails to close, its zone stays `ON` with `SECONDS` at `1` or `0` while the daemon
 keeps retrying.
+
+### Protocol
+
+Each connection carries one command line and gets one reply line, then closes.
+The commands are:
+
+- `ZONE=n TIME=s` – open zone `n` (1 to 14) for `s` seconds (1 to 7200),
+  replacing any run already on it
+- `ZONE=n TIME=0` – close zone `n` now
+- `STATUS` – report every zone, as above
+
+Over plain text, add `TOKEN=your-long-random-token`. Over TLS, `TOKEN=` is not
+needed and is ignored. Words are separated by spaces or tabs, in any order, and
+unknown words are ignored. A line with `STATUS` in it is a status request, even
+if it also has `ZONE=` or `TIME=`. A carriage return is ignored, so `\r\n` works.
+
+A line can be at most 254 bytes before its newline. A longer one is refused
+whole, as is a line with a NUL byte in it, since acting on part of a command can
+change its meaning. An empty line gets no reply.
+
+Replies:
+
+- `OK` – the zone was opened or closed
+- `OK STATUS ...` – see [Status](#status)
+- `ERR auth required` – plain text with a missing or wrong `TOKEN=`
+- `ERR plain text disabled, use TLS` – plain text while `IRRIGATIOND_PLAIN_TOKEN=no`
+- `ERR missing ZONE or TIME`
+- `ERR invalid ZONE format`, `ERR invalid TIME format` – not a whole number
+- `ERR invalid ZONE or TIME` – zone outside 1 to 14, or time outside 0 to 7200
+- `ERR zone at maximum runtime` – see [Run limits](#run-limits)
+- `ERR valve write failed` – the MCP23017 didn't take the write. For a start,
+  the zone is closed again. For a stop, the daemon keeps retrying every second
+- `ERR command too long`, `ERR invalid character` – see above
+- `ERR server busy` – no free connection slot, sent before any TLS handshake
+- `ERR rate limit exceeded` – too many failed logins from this address, see
+  [Security Notes](#-security-notes)
+
+A TLS handshake with the wrong token gets no reply: the handshake fails.
 
 ### Debugging by hand
 
@@ -221,7 +309,8 @@ read, changed or replayed. There are no certificates to manage.
 
 Nothing stops working at any step, and the token stays the same.
 
-1. Update and reinstall irrigationd. Your existing `/etc/default/irrigationd`
+1. Update irrigationd, run `sudo make install`, then
+   `sudo systemctl restart irrigationd`. Your existing `/etc/default/irrigationd`
    has no `IRRIGATIOND_PLAIN_TOKEN`, so plain text keeps working.
 2. Update the Home Assistant integration. It switches to TLS by itself.
 3. Add `IRRIGATIOND_PLAIN_TOKEN=no` to `/etc/default/irrigationd` and run
@@ -242,7 +331,8 @@ the token in plain text.
   address>`, then restart. Only those addresses can connect, whatever the firewall says.
 - The unit runs the daemon in a tight sandbox: no capabilities, a read-only
   system, only the I2C bus from `/dev`, and only the system calls a normal
-  service needs. If you move the MCP23017 to another bus, update `DeviceAllow=`.
+  service needs. The bus, `/dev/i2c-1`, is fixed in the code, and the unit's
+  `DeviceAllow=` matches it.
 - Set `IRRIGATIOND_PLAIN_TOKEN=no` once every client uses TLS.
 - Home Assistant integration must be configured with the same token.
 - After 10 connections from one IP fail to authenticate within 60 seconds, each
@@ -268,3 +358,54 @@ the token in plain text.
   the rest, so a flood can't fill the journal and hide the daemon's own messages.
 
 ---
+
+## Valve safety
+
+- At startup, irrigationd closes every zone before it accepts any command.
+- Each run closes on irrigationd's own timer, on the monotonic clock, so a
+  clock change doesn't move it. A valve that fails to close is retried every
+  second, and its zone shows as `ON` until it closes.
+- Each valve write is read back from the MCP23017, so a write the chip didn't
+  take counts as failed. Before each write, the chip is checked for a reset,
+  such as a brown-out when a solenoid starts, and set up again if needed.
+- A watchdog runs every 30 seconds. It checks that the chip still has every pin
+  as an output and the latches irrigationd last wrote, and sets it up again if
+  not. It also closes any zone that has been open more than 60 seconds past its
+  run.
+- SIGTERM and SIGINT close every zone, then exit. SIGHUP and SIGQUIT do the
+  same but exit with a failure, so systemd starts the daemon again: a
+  `kill -HUP` sent to reload it doesn't leave it stopped. A valve that fails to
+  close on the way out is retried every half second for up to 30 seconds, and
+  then irrigationd exits with a failure, so systemd restarts it and startup
+  closes every zone again.
+
+---
+
+## Development
+
+`make test` runs the end to end protocol tests in `tests/test_protocol.py`. They
+start a test build of the real daemon, `bin/irrigationd-test`, with a fake valve
+driver (`tests/fake_mcp23017.c`) on port 14242, and talk to it with
+`irrigationctl` and plain sockets. The checks that connect the way Home
+Assistant does need Python 3.13 or later, and print `SKIP` on older versions.
+
+GitHub Actions runs on every pull request and push to `main`:
+
+- `ci.yml` – builds with gcc and clang on x64 and arm64 with
+  `-Wall -Wextra -Wshadow -Wformat=2 -Werror`, and runs `make test` on
+  Python 3.13, failing if any check is skipped. It also runs the tests under
+  AddressSanitizer and UBSan, builds and tests on Debian bookworm on arm64 (as
+  on Raspberry Pi OS), and runs `cppcheck` on the C code and `shellcheck` on
+  `scripts/`.
+- `codeql.yml` – CodeQL analysis of the C code, also weekly.
+- `release-check.yml` – on a `vX.Y.Z` tag, fails unless `CHANGELOG.md` has a
+  `## X.Y.Z - YYYY-MM-DD` heading for that version.
+
+To build the way CI does:
+
+```bash
+make CFLAGS="-Wall -Wextra -Wshadow -Wformat=2 -Werror -O2 -Iinclude" all test
+```
+
+Record each change under `## Unreleased` in `CHANGELOG.md`, and give it a
+version heading when it's released.

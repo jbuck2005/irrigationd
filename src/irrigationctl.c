@@ -94,7 +94,11 @@ static int connect_to_daemon(void) {
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s \"COMMAND\"\n", argv[0]);
+        fprintf(stderr, "Commands: \"ZONE=n TIME=s\", \"ZONE=n TIME=0\" (stop), \"STATUS\"\n");
         fprintf(stderr, "The token comes from IRRIGATION_TOKEN, or a TOKEN= field in the command.\n");
+        fprintf(stderr, "IRRIGATION_HOST (an IPv4 address) and IRRIGATION_PORT pick the daemon "
+                        "(default %s:%d).\n", DEFAULT_HOST, DEFAULT_PORT);
+        fprintf(stderr, "IRRIGATION_PLAIN=1 sends it in plain text, for an irrigationd without TLS.\n");
         exit(EXIT_FAILURE);
     }
 

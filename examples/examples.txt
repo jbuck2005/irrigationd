@@ -2,3 +2,9 @@
 # (and IRRIGATION_HOST set if irrigationd is on another machine)
 
 irrigationctl "ZONE=1 TIME=120"
+
+# Close zone 1 now
+irrigationctl "ZONE=1 TIME=0"
+
+# Report every zone without changing any valve
+irrigationctl "STATUS"
