@@ -805,6 +805,12 @@ static void *watchdog_thread(void *arg) {
         pthread_mutex_lock(&zone_lock);
         int64_t now = now_ms();
 
+        // A chip reset leaves every pin an input until the next valve write,
+        // which may be hours away when nothing is running, so check it here too
+        if (mcp_check_chip() < 0) {
+            fprintf(stderr, "WATCHDOG: could not read the MCP23017\n");
+        }
+
         for (int z = 1; z <= MAX_ZONE; z++) {
             if (zone_timers[z].start_ms > 0) {
                 time_t elapsed = (now - zone_timers[z].start_ms) / 1000;

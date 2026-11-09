@@ -165,6 +165,22 @@ int mcp_set_zone_state(int zone, int state) {
     return rc;
 }
 
+int mcp_check_chip(void) {
+    uint8_t dir_a = 0, dir_b = 0, got_a = 0, got_b = 0;
+    int rc = 0;
+    mcp_lock();
+    if (i2c_read_reg(MCP23017_IODIRA, &dir_a) < 0 || i2c_read_reg(MCP23017_IODIRB, &dir_b) < 0 ||
+        i2c_read_reg(MCP23017_OLATA, &got_a) < 0 || i2c_read_reg(MCP23017_OLATB, &got_b) < 0) {
+        rc = -1;
+    } else if (dir_a != 0x00 || dir_b != 0x00 || got_a != olat_a || got_b != olat_b) {
+        fprintf(stderr, "MCP23017 lost its setup (IODIR %02x %02x, latches %02x %02x, wanted %02x %02x): "
+                        "setting it up again\n", dir_a, dir_b, got_a, got_b, olat_a, olat_b);
+        rc = configure_chip() < 0 ? -1 : 1;
+    }
+    mcp_unlock();
+    return rc;
+}
+
 int mcp_get_zone_state(int zone) {
     uint8_t is_b, mask;
     if (zone_to_pin(zone, &is_b, &mask) < 0) return -1;
