@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.2 - 2026-11-09
+
 - A command with a NUL byte in it is refused with `ERR invalid character`. Before, everything after the NUL was ignored, which can change a command's meaning, such as `TIME=3<NUL>600` read as `TIME=3`
 
 ## 1.0.1 - 2026-11-09
