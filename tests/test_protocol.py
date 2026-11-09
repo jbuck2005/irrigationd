@@ -269,10 +269,60 @@ def test_slow_clients_cant_lock_out_the_trusted_host():
             sock.close()
         daemon.stop()
 
+
+def test_impostor_with_a_certificate_is_refused():
+    """irrigationctl doesn't accept a server that offers a certificate instead of the key."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cert, key = os.path.join(tmp, "cert.pem"), os.path.join(tmp, "key.pem")
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+             "-nodes", "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=impostor"],
+            check=True, capture_output=True,
+        )
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        listener = socket.socket()
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((HOST, PORT))
+        listener.listen(1)
+        received = bytearray()
+
+        def serve():
+            conn, _ = listener.accept()
+            conn.settimeout(5)
+            try:
+                with ctx.wrap_socket(conn, server_side=True) as tls:
+                    received.extend(tls.recv(100))
+                    tls.sendall(b"OK\n")
+            except (OSError, ssl.SSLError):
+                pass
+
+        thread = threading.Thread(target=serve)
+        thread.start()
+        rc, out, err = ctl("ZONE=1 TIME=0", token="not-the-token")
+        thread.join(timeout=10)
+        listener.close()
+    check("irrigationctl refuses a server with a certificate", rc != 0 and "OK" not in out, out + err)
+    check("the impostor receives no command", bytes(received) == b"", bytes(received))
+
+
+def test_token_on_command_line_warns():
+    daemon = Daemon()
+    try:
+        rc, out, err = ctl(f"STATUS TOKEN={TOKEN}")
+        check("a token on the command line still works", rc == 0 and "OK STATUS" in out, out + err)
+        check("a token on the command line is warned about", "Set IRRIGATION_TOKEN instead" in err, err)
+        rc, out, err = ctl("STATUS", token=TOKEN)
+        check("IRRIGATION_TOKEN gives no warning", "Warning" not in err, err)
+    finally:
+        daemon.stop()
+
 test_tls_and_plain_allowed()
 test_plain_disabled()
 test_token_never_sent()
 test_slow_clients_cant_lock_out_the_trusted_host()
+test_impostor_with_a_certificate_is_refused()
+test_token_on_command_line_warns()
 
 print()
 if failures:

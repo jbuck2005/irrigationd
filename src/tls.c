@@ -123,8 +123,11 @@ SSL_CTX *tls_client_ctx(const char *token) {
     if (ctx == NULL) {
         return NULL;
     }
-    // The key proves who the server is, so there is no certificate to check.
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    // Only the key proves who the server is. A handshake with the key carries
+    // no certificate, so requiring one that can never be verified (no CA
+    // certificates are loaded) refuses a server that skips the key and offers
+    // a certificate instead, such as an impostor that doesn't know the token.
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
     SSL_CTX_set_psk_use_session_callback(ctx, psk_use_session);
     return ctx;
 }

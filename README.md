@@ -96,8 +96,11 @@ sudo journalctl -u irrigationd -f
 
 `irrigationctl` connects with TLS. It takes the token from `IRRIGATION_TOKEN`,
 or from a `TOKEN=` field in the command, which it then leaves out of what it
-sends. `IRRIGATION_HOST` and `IRRIGATION_PORT` pick the daemon (default
-`127.0.0.1:4242`).
+sends. Prefer `IRRIGATION_TOKEN`: a token on the command line can be seen by
+other users in `ps` and stays in your shell history, so `irrigationctl` warns
+about it. `IRRIGATION_HOST` and `IRRIGATION_PORT` pick the daemon (default
+`127.0.0.1:4242`). It refuses a server that doesn't prove it has the token,
+such as one offering a certificate instead.
 
 Turn on zone 1 for 30 seconds:
 
