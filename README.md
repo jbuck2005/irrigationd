@@ -76,10 +76,9 @@ sudo sed -i -E "s|^#?[[:space:]]*IRRIGATIOND_TOKEN=.*|IRRIGATIOND_TOKEN=$(openss
 
 Then restart the daemon and enter the new token in Home Assistant.
 
-Reload systemd and enable the service:
+`make install` reloads systemd, so just enable and start the service:
 
 ```bash
-sudo systemctl daemon-reload
 sudo systemctl enable irrigationd
 sudo systemctl start irrigationd
 ```
