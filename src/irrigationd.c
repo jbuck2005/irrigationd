@@ -592,6 +592,12 @@ static void handle_line(struct conn *conn, const char *addrbuf, int over_limit, 
         const char err[] = "ERR command too long\n";
         conn_write(conn, err, sizeof(err) - 1);
         fprintf(stderr, "[%s] Rejected command (too long)\n", addrbuf);
+    } else if (n > 0 && strlen(buf) != (size_t)n) {
+        // The parser stops at a NUL byte, so the rest would be ignored, such as
+        // TIME=3<NUL>600 read as TIME=3, so refuse it whole
+        const char err[] = "ERR invalid character\n";
+        conn_write(conn, err, sizeof(err) - 1);
+        fprintf(stderr, "[%s] Rejected command (NUL byte)\n", addrbuf);
     } else if (n > 0) {
         parse_command(conn, buf, addrbuf, over_limit, authenticated);
     } else if (n < 0) {
