@@ -301,6 +301,7 @@ def test_irrigationctl_reports_busy():
     daemon = Daemon()
     socks = []
     try:
+        time.sleep(0.5)  # until the start-up check's connection has let go of its slot
         for _ in range(4):
             socks.append(slow_client(HOST))
         time.sleep(0.5)

@@ -51,6 +51,31 @@ static int i2c_read_reg(uint8_t reg, uint8_t *val) {
     return 0;
 }
 
+// Writes the cached latches, then makes every pin an output. The latches go
+// first so a pin never drives a stale value, even for a moment.
+static int configure_chip(void) {
+    if (i2c_write_reg(MCP23017_OLATA, olat_a) < 0) return -1;
+    if (i2c_write_reg(MCP23017_OLATB, olat_b) < 0) return -1;
+    if (i2c_write_reg(MCP23017_IODIRA, 0x00) < 0) return -1;
+    if (i2c_write_reg(MCP23017_IODIRB, 0x00) < 0) return -1;
+    return 0;
+}
+
+// A brown-out, such as from a solenoid starting, can reset the chip: every
+// pin goes back to an input and writes to the latches still succeed, so valves
+// would silently stop following commands. Check before each write, and set the
+// chip up again if it was reset.
+static void recover_if_reset(void) {
+    uint8_t dir_a = 0, dir_b = 0;
+    if (i2c_read_reg(MCP23017_IODIRA, &dir_a) < 0 || i2c_read_reg(MCP23017_IODIRB, &dir_b) < 0) {
+        return;                                                                    // The write that follows reports the failure
+    }
+    if (dir_a != 0x00 || dir_b != 0x00) {
+        fprintf(stderr, "MCP23017 was reset (IODIR %02x %02x): setting it up again\n", dir_a, dir_b);
+        (void)configure_chip();
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Driver open/close
 // -----------------------------------------------------------------------------
@@ -68,15 +93,14 @@ int mcp_i2c_open(const char *dev) {
         return -1;
     }
 
-    // Configure all 16 pins as outputs                                          //
-    if (i2c_write_reg(MCP23017_IODIRA, 0x00) < 0) return -1;
-    if (i2c_write_reg(MCP23017_IODIRB, 0x00) < 0) return -1;
-
-    // Initialize all outputs to OFF (0)                                         //
+    // Initialize all outputs to OFF (0), then make all 16 pins outputs
     olat_a = 0x00;
     olat_b = 0x00;
-    if (i2c_write_reg(MCP23017_OLATA, olat_a) < 0) return -1;
-    if (i2c_write_reg(MCP23017_OLATB, olat_b) < 0) return -1;
+    if (configure_chip() < 0) {
+        close(i2c_fd);
+        i2c_fd = -1;
+        return -1;
+    }
 
     return 0;
 }
@@ -123,12 +147,18 @@ int mcp_set_zone_state(int zone, int state) {
 
     int rc;
     mcp_lock();
-    if (is_b) {
-        if (state) olat_b |= mask; else olat_b &= ~mask;
-        rc = i2c_write_reg(MCP23017_OLATB, olat_b);
-    } else {
-        if (state) olat_a |= mask; else olat_a &= ~mask;
-        rc = i2c_write_reg(MCP23017_OLATA, olat_a);
+    recover_if_reset();
+    uint8_t reg = is_b ? MCP23017_OLATB : MCP23017_OLATA;
+    uint8_t *olat = is_b ? &olat_b : &olat_a;
+    if (state) *olat |= mask; else *olat &= ~mask;
+    rc = i2c_write_reg(reg, *olat);
+
+    // Read the latch back, so a write the chip didn't take counts as failed
+    // and the caller retries a close
+    uint8_t got = 0;
+    if (rc == 0 && (i2c_read_reg(reg, &got) < 0 || got != *olat)) {
+        fprintf(stderr, "MCP23017: latch 0x%02x reads %02x, wanted %02x\n", reg, got, *olat);
+        rc = -1;
     }
     mcp_unlock();
 
