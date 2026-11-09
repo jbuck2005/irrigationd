@@ -13,6 +13,11 @@ fi
 # Also for a file that's already there, which may hold a token
 chmod 600 "$CONF"
 
+# Printed on every install until it's set
+if ! grep -Eq '^IRRIGATIOND_TRUSTED_ADDR=[0-9]' "$CONF"; then
+	echo "Recommended: set IRRIGATIOND_TRUSTED_ADDR in /etc/default/irrigationd to your Home Assistant address"
+fi
+
 current=$(sed -n 's/^IRRIGATIOND_TOKEN=//p' "$CONF" | tail -n 1)
 case "$current" in
 	""|CHANGE_ME_to_a_long_random_token|your-long-random-token) ;;

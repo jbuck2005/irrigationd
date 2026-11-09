@@ -3,8 +3,9 @@
 # your own value, which you can generate with: openssl rand -hex 16
 #IRRIGATIOND_TOKEN=
 IRRIGATIOND_BIND_ADDR=127.0.0.1
-# Optional. Exempts one IPv4 address from the failed-login rate limit. Set this to
-# the Home Assistant host, which holds the token anyway.
+# Recommended when Home Assistant runs on another machine. Exempts one IPv4
+# address from the failed-login rate limit and keeps connection slots for it.
+# Set this to the Home Assistant host, which holds the token anyway.
 #IRRIGATIOND_TRUSTED_ADDR=
 # Plain text logins, where the token crosses the network readable, are off.
 # Clients connect with TLS, using the token as the key, so it is never sent.

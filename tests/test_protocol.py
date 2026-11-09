@@ -424,6 +424,25 @@ def test_failed_close_at_shutdown_is_retried():
           and "closed on retry" in after, f"exit={code}\n{log}")
 
 
+def startup_log(**env):
+    """Run the daemon for a moment on an address nothing connects to, and return its log."""
+    full_env = {"PATH": os.environ.get("PATH", ""), "IRRIGATIOND_TOKEN": TOKEN, **env}
+    proc = subprocess.Popen([DAEMON], env=full_env, stderr=subprocess.PIPE, text=True)
+    time.sleep(0.5)
+    proc.terminate()
+    return proc.communicate(timeout=10)[1]
+
+
+def test_trusted_addr_reminder():
+    reminder = "IRRIGATIOND_TRUSTED_ADDR is not set"
+    check("a reminder is logged when listening beyond this machine without a trusted address",
+          reminder in startup_log(IRRIGATIOND_BIND_ADDR="127.0.0.2"))
+    check("no reminder with a trusted address set",
+          reminder not in startup_log(IRRIGATIOND_BIND_ADDR="127.0.0.2", IRRIGATIOND_TRUSTED_ADDR="192.0.2.10"))
+    check("no reminder when listening only on 127.0.0.1",
+          reminder not in startup_log(IRRIGATIOND_BIND_ADDR=HOST))
+
+
 test_tls_and_plain_allowed()
 test_plain_disabled()
 test_token_never_sent()
@@ -435,6 +454,7 @@ test_impostor_with_a_certificate_is_refused()
 test_token_on_command_line_warns()
 test_every_stop_signal_closes_the_valves()
 test_failed_close_at_shutdown_is_retried()
+test_trusted_addr_reminder()
 
 print()
 if failures:

@@ -58,8 +58,9 @@ IRRIGATIOND_BIND_ADDR=127.0.0.1
   `TOKEN=` lines, for clients that don't speak TLS yet, and logs a warning at
   most once an hour while they are used. When missing, as in a config file from
   before TLS, it means `yes`. See [Encryption](#-encryption).
-- **IRRIGATIOND_TRUSTED_ADDR** – optional. One IPv4 address that the rate limit
-  does not apply to. See [Security Notes](#-security-notes).
+- **IRRIGATIOND_TRUSTED_ADDR** – recommended when Home Assistant runs on another
+  machine. One IPv4 address that the rate limit does not apply to, and that always
+  gets one of the reserved connection slots. See [Security Notes](#-security-notes).
 
 To show the token again:
 
@@ -258,9 +259,12 @@ the token in plain text.
   and the last 4 slots are kept for `IRRIGATIOND_TRUSTED_ADDR` and for any
   address that used the token in the last 15 minutes, such as Home Assistant,
   which polls every 15 seconds. Further connections get `ERR server busy`
-  straight away. So devices on the network without the token can't hold
-  connections open to shut Home Assistant out. Setting `IRRIGATIOND_TRUSTED_ADDR`
-  still helps right after a restart, before Home Assistant has connected.
+  straight away. So once Home Assistant has connected, devices on the network
+  without the token can't hold connections open to shut it out. Right after
+  irrigationd starts, or after Home Assistant has been away for 15 minutes, it
+  is unknown again, and a flood that is already under way can keep it out. Set
+  `IRRIGATIOND_TRUSTED_ADDR` to close that gap; irrigationd logs a reminder at
+  startup while it isn't set. Zones still close on irrigationd's own timer.
 - Refused connections are logged at most 10 every 10 seconds, with a count of
   the rest, so a flood can't fill the journal and hide the daemon's own messages.
 

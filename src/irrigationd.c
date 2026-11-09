@@ -927,6 +927,13 @@ int main(void) {
         }
     }
 
+    // Without it, Home Assistant only gets the reserved slots once it has used
+    // the token, so a flood that starts before then keeps it out
+    if (!g_have_trusted_addr && have_bind_addr && bind_addr.s_addr != htonl(INADDR_LOOPBACK)) {
+        fprintf(stderr, "IRRIGATIOND_TRUSTED_ADDR is not set. Set it to your Home Assistant address, "
+                        "so devices without the token can't keep it out right after a restart\n");
+    }
+
     if (mcp_i2c_open("/dev/i2c-1") < 0) {
         fprintf(stderr, "ERROR: Failed to open I2C bus\n");
         exit(EXIT_FAILURE);
