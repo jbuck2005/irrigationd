@@ -49,6 +49,11 @@
 #define STATUS_BUF_SZ   (32 + 16 * MAX_ZONE)                                       // Header, plus up to 16 bytes per zone
 #define MAX_CLIENTS     16                                                         // Max concurrent client connections
 #define MAX_CLIENTS_PER_IP 4                                                       // Max concurrent connections from one address
+#define RESERVED_SLOTS  4                                                          // Kept for the trusted address and known clients
+#define MAX_KNOWN_CLIENTS 4                                                        // Addresses that recently used the token
+#define KNOWN_CLIENT_MS (15 * 60 * 1000)                                           // How long a client stays known after using it
+#define REFUSAL_LOG_BURST 10                                                       // Refused connections logged per window...
+#define REFUSAL_LOG_WINDOW_MS 10000                                                // ...before the rest are only counted
 #define CONN_DEADLINE_MS 5000                                                      // A whole connection: handshake, command and reply
 #define MAX_ZONE_RUNTIME 7200                                                      // Safety: max zone runtime = 2 hours
 #define WATCHDOG_INTERVAL 30                                                       // Watchdog check interval in seconds
@@ -85,6 +90,8 @@ typedef struct {
 } ClientSlot;
 
 static ClientSlot client_slots[MAX_CLIENTS];
+// Addresses that proved they hold the token, and when. Guarded by client_slots_lock.
+static struct { uint32_t ip_addr; int64_t seen_ms; } known_clients[MAX_KNOWN_CLIENTS];
 static pthread_mutex_t client_slots_lock = PTHREAD_MUTEX_INITIALIZER;
 static const char *g_auth_token = NULL;
 static struct in_addr g_trusted_addr;       // Exempt from the rate limit, if set
@@ -608,9 +615,70 @@ static void handle_tls(struct conn *conn, const char *addrbuf, int over_limit, i
 
 enum slot_result { SLOT_OK, SLOT_BUSY, SLOT_IP_BUSY };
 
+// Whether `ip` used the token recently. Call with client_slots_lock held.
+static int is_known_client(uint32_t ip, int64_t now) {
+    for (int i = 0; i < MAX_KNOWN_CLIENTS; i++) {
+        if (known_clients[i].ip_addr == ip && known_clients[i].seen_ms != 0 &&
+            now - known_clients[i].seen_ms < KNOWN_CLIENT_MS) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Remembers that `ip` just used the token, so it can use the reserved slots
+// even when IRRIGATIOND_TRUSTED_ADDR isn't set. Replaces the oldest entry.
+static void note_known_client(struct in_addr ip) {
+    pthread_mutex_lock(&client_slots_lock);
+    int64_t now = now_ms();
+    int idx = 0;
+    for (int i = 0; i < MAX_KNOWN_CLIENTS; i++) {
+        if (known_clients[i].ip_addr == ip.s_addr) { idx = i; break; }
+        if (known_clients[i].seen_ms < known_clients[idx].seen_ms) idx = i;
+    }
+    known_clients[idx].ip_addr = ip.s_addr;
+    known_clients[idx].seen_ms = now;
+    pthread_mutex_unlock(&client_slots_lock);
+}
+
+// Logs a refused connection, but at most REFUSAL_LOG_BURST of them each
+// REFUSAL_LOG_WINDOW_MS, so a flood can't wear out the SD card or push the
+// daemon's own messages out of the journal. The rest are counted and summed up.
+// With cli NULL, only writes the sum once the window is over.
+static void log_refusal(const struct sockaddr_in *cli, const char *reason) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    static int64_t window_start = 0;
+    static int logged = 0;
+    static long suppressed = 0;
+    pthread_mutex_lock(&lock);
+    int64_t now = now_ms();
+    if (now - window_start >= REFUSAL_LOG_WINDOW_MS) {
+        if (suppressed > 0) {
+            fprintf(stderr, "%ld more connections were refused and not logged\n", suppressed);
+        }
+        window_start = now;
+        logged = 0;
+        suppressed = 0;
+    }
+    if (cli == NULL) {
+        // Nothing to log
+    } else if (logged < REFUSAL_LOG_BURST) {
+        logged++;
+        char addrbuf[64];
+        format_client_addr(cli, addrbuf, sizeof(addrbuf));
+        fprintf(stderr, "[%s] Connection rejected: %s\n", addrbuf, reason);
+    } else {
+        suppressed++;
+    }
+    pthread_mutex_unlock(&lock);
+}
+
 // Takes a slot for a new connection, and puts its index in *index.
 static enum slot_result client_slot_take(int fd, struct in_addr ip, int trusted, int *index) {
     pthread_mutex_lock(&client_slots_lock);
+    // A client that recently used the token, such as Home Assistant, is let in
+    // even while unknown addresses hold every other slot
+    trusted = trusted || is_known_client(ip.s_addr, now_ms());
     int used = 0, from_ip = 0, free_idx = -1;
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (client_slots[i].in_use) {
@@ -624,8 +692,8 @@ static enum slot_result client_slot_take(int fd, struct in_addr ip, int trusted,
     enum slot_result result = SLOT_OK;
     if (free_idx < 0) {
         result = SLOT_BUSY;
-    } else if (!trusted && used >= MAX_CLIENTS - 1) {
-        result = SLOT_BUSY;                                                        // The last slot is the trusted address's
+    } else if (!trusted && used >= MAX_CLIENTS - RESERVED_SLOTS) {
+        result = SLOT_BUSY;                                                        // The last slots are for trusted and known clients
     } else if (!trusted && from_ip >= MAX_CLIENTS_PER_IP) {
         result = SLOT_IP_BUSY;
     } else {
@@ -655,6 +723,7 @@ static void *reaper_thread(void *arg) {
     (void)arg;
     while (1) {
         sleep(1);
+        log_refusal(NULL, NULL);
         pthread_mutex_lock(&client_slots_lock);
         int64_t now = now_ms();
         for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -715,6 +784,9 @@ static void *client_thread(void *arg) {
 
     client_slot_release(slot);
     close(cfd);
+    if (authenticated) {
+        note_known_client(cli.sin_addr);
+    }
     rate_limit_finish(cli.sin_addr, over_limit, authenticated);
     return NULL;
 }
@@ -984,9 +1056,7 @@ int main(void) {
         int trusted = g_have_trusted_addr && cli.sin_addr.s_addr == g_trusted_addr.s_addr;
         enum rate_limit_result rate = trusted ? RATE_OK : rate_limit_accept(cli.sin_addr);
         if (rate == RATE_REFUSED) {
-            char addrbuf[64];
-            format_client_addr(&cli, addrbuf, sizeof(addrbuf));
-            fprintf(stderr, "[%s] Connection rejected: rate limit exceeded\n", addrbuf);
+            log_refusal(&cli, "rate limit exceeded");
             const char err[] = "ERR rate limit exceeded\n";
             (void)!write(cfd, err, sizeof(err)-1);
             close(cfd);
@@ -997,10 +1067,8 @@ int main(void) {
         int slot = -1;
         enum slot_result taken = client_slot_take(cfd, cli.sin_addr, trusted, &slot);
         if (taken != SLOT_OK) {
-            char addrbuf[64];
-            format_client_addr(&cli, addrbuf, sizeof(addrbuf));
-            fprintf(stderr, "[%s] Connection rejected: %s\n", addrbuf,
-                    taken == SLOT_IP_BUSY ? "too many connections from this address" : "all client slots in use");
+            log_refusal(&cli, taken == SLOT_IP_BUSY ? "too many connections from this address"
+                                                    : "all client slots in use");
             const char err[] = "ERR server busy\n";
             (void)!write(cfd, err, sizeof(err) - 1);
             close(cfd);

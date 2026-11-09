@@ -10,6 +10,8 @@ if [ ! -f "$CONF" ]; then
 	install -m 600 irrigationd.default "$CONF"
 	echo "Installed default /etc/default/irrigationd"
 fi
+# Also for a file that's already there, which may hold a token
+chmod 600 "$CONF"
 
 current=$(sed -n 's/^IRRIGATIOND_TOKEN=//p' "$CONF" | tail -n 1)
 case "$current" in

@@ -271,6 +271,72 @@ def test_slow_clients_cant_lock_out_the_trusted_host():
         daemon.stop()
 
 
+def test_known_client_gets_through_without_trusted_addr():
+    """With no IRRIGATIOND_TRUSTED_ADDR, a client that used the token keeps a way in."""
+    daemon = Daemon()
+    socks = []
+    try:
+        rc, out, err = ctl("STATUS", token=TOKEN)
+        check("a first command works", rc == 0 and "OK STATUS" in out, out + err)
+        # Unknown addresses try for every slot
+        for i in range(16):
+            try:
+                socks.append(slow_client(f"127.0.0.{10 + i // 4}"))
+            except OSError:
+                pass
+        time.sleep(0.5)
+        with socket.create_connection((HOST, PORT), timeout=5, source_address=("127.0.0.20", 0)) as extra:
+            reply = extra.recv(100).decode().strip()
+        check("an unknown address is refused once the open slots are full", reply == "ERR server busy", reply)
+        rc, out, err = ctl("STATUS", token=TOKEN)
+        check("a client that used the token still gets through", rc == 0 and "OK STATUS" in out, out + err)
+    finally:
+        for sock in socks:
+            sock.close()
+        daemon.stop()
+
+
+def test_irrigationctl_reports_busy():
+    """A busy reply isn't reported as a wrong token."""
+    daemon = Daemon()
+    socks = []
+    try:
+        for _ in range(4):
+            socks.append(slow_client(HOST))
+        time.sleep(0.5)
+        rc, out, err = ctl("STATUS", token=TOKEN)
+        check("irrigationctl says irrigationd is busy", rc != 0 and "busy" in err and "token is wrong" not in err,
+              out + err)
+    finally:
+        for sock in socks:
+            sock.close()
+        daemon.stop()
+
+
+def test_refusals_are_not_all_logged():
+    """A flood of refused connections writes a few lines and a count, not one line each."""
+    daemon = Daemon()
+    socks = []
+    try:
+        for _ in range(4):
+            socks.append(slow_client("127.0.0.30"))
+        for _ in range(200):
+            try:
+                with socket.create_connection((HOST, PORT), timeout=2, source_address=("127.0.0.30", 0)) as s:
+                    s.recv(100)
+            except OSError:
+                pass
+        for sock in socks:
+            sock.close()
+        time.sleep(11.5)  # the window ends, and its sum is written
+        log = daemon.output()
+    finally:
+        daemon.stop()
+    lines = log.count("Connection rejected")
+    check("refused connections are logged at most 10 at a time", 1 <= lines <= 10, f"{lines} lines")
+    check("the rest are counted", "more connections were refused and not logged" in log, log[-500:])
+
+
 def test_impostor_with_a_certificate_is_refused():
     """irrigationctl doesn't accept a server that offers a certificate instead of the key."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -359,6 +425,9 @@ test_tls_and_plain_allowed()
 test_plain_disabled()
 test_token_never_sent()
 test_slow_clients_cant_lock_out_the_trusted_host()
+test_known_client_gets_through_without_trusted_addr()
+test_refusals_are_not_all_logged()
+test_irrigationctl_reports_busy()
 test_impostor_with_a_certificate_is_refused()
 test_token_on_command_line_warns()
 test_every_stop_signal_closes_the_valves()
