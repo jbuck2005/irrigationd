@@ -1,0 +1,138 @@
+name: CI
+
+# Builds irrigationd and runs the protocol tests against the real daemon with a
+# fake valve driver. No hardware, no secrets, and no network beyond 127.0.0.1.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WARN: -Wall -Wextra -Wshadow -Wformat=2 -Werror
+
+jobs:
+  test:
+    name: Test (${{ matrix.cc }}, ${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        arch: [x64, arm64]
+        include:
+          - arch: x64
+            os: ubuntu-24.04
+          - arch: arm64
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Python 3.13 or later, so the tests also connect the way Home Assistant does
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Install build dependencies
+        run: sudo apt-get update -q && sudo apt-get install -y -q libssl-dev
+
+      - name: Build with warnings as errors
+        run: make CC=${{ matrix.cc }} CFLAGS="$WARN -O2 -Iinclude" all bin/irrigationd-test
+
+      - name: Run protocol tests
+        run: |
+          set -o pipefail
+          make CC=${{ matrix.cc }} CFLAGS="$WARN -O2 -Iinclude" test | tee test.log
+          # Every check must run here, including the ones older Pythons skip
+          if grep -q '^SKIP' test.log; then
+            echo "::error::Some tests were skipped"
+            exit 1
+          fi
+
+  sanitizers:
+    name: AddressSanitizer + UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+
+      - name: Install build dependencies
+        run: sudo apt-get update -q && sudo apt-get install -y -q libssl-dev
+
+      - name: Run protocol tests under the sanitizers
+        env:
+          SAN: -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
+        run: |
+          mkdir -p "$RUNNER_TEMP/san"
+          export ASAN_OPTIONS="log_path=$RUNNER_TEMP/san/asan:detect_leaks=1"
+          export UBSAN_OPTIONS="log_path=$RUNNER_TEMP/san/ubsan:print_stacktrace=1"
+          make test CFLAGS="$WARN -O1 -g $SAN -Iinclude" LDFLAGS="-pthread $SAN"
+
+      # The daemon runs in the background, so a report may not fail the tests
+      # by itself; any report file fails the job
+      - name: Check for sanitizer reports
+        if: always()
+        run: |
+          if ls "$RUNNER_TEMP"/san/* >/dev/null 2>&1; then
+            cat "$RUNNER_TEMP"/san/*
+            echo "::error::Sanitizer reported a problem"
+            exit 1
+          fi
+          echo "No sanitizer reports"
+
+  pi-os:
+    # Same Debian release, Python and OpenSSL as Raspberry Pi OS (bookworm), on ARM
+    name: Test (Debian bookworm, arm64)
+    runs-on: ubuntu-24.04-arm
+    container: debian:bookworm
+    timeout-minutes: 15
+    steps:
+      - name: Install build dependencies
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends ca-certificates gcc libc6-dev make libssl-dev openssl python3
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build with warnings as errors
+        run: make CFLAGS="$WARN -O2 -Iinclude" all bin/irrigationd-test
+
+      - name: Run protocol tests
+        run: make CFLAGS="$WARN -O2 -Iinclude" test
+
+  lint:
+    name: Static analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q cppcheck shellcheck
+
+      - name: cppcheck
+        run: >
+          cppcheck --enable=warning,portability,performance --error-exitcode=1
+          --inline-suppr --suppress=missingIncludeSystem -q -Iinclude
+          src tests/fake_mcp23017.c
+
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
