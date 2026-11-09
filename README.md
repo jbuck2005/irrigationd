@@ -33,6 +33,7 @@ This installs:
 - `/usr/local/bin/irrigationctl` – the CLI tool
 - `/etc/systemd/system/irrigationd.service` – systemd unit
 - `/etc/default/irrigationd` – configuration file (token and bind address)
+- an `irrigation` system user in the `i2c` group, which the service runs as
 
 ---
 
@@ -254,8 +255,13 @@ the token in plain text.
   an address that already has the token, because guesses from it are not limited.
 - Each connection gets 5 seconds for its handshake, command and reply, then it is
   closed. At most 16 connections are open at once, at most 4 from one address,
-  and the last free slot is kept for `IRRIGATIOND_TRUSTED_ADDR`. Further
-  connections get `ERR server busy` straight away. So a device on the network
-  without the token can't hold connections open to shut Home Assistant out.
+  and the last 4 slots are kept for `IRRIGATIOND_TRUSTED_ADDR` and for any
+  address that used the token in the last 15 minutes, such as Home Assistant,
+  which polls every 15 seconds. Further connections get `ERR server busy`
+  straight away. So devices on the network without the token can't hold
+  connections open to shut Home Assistant out. Setting `IRRIGATIOND_TRUSTED_ADDR`
+  still helps right after a restart, before Home Assistant has connected.
+- Refused connections are logged at most 10 every 10 seconds, with a count of
+  the rest, so a flood can't fill the journal and hide the daemon's own messages.
 
 ---

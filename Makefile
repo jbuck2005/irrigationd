@@ -58,6 +58,7 @@ install: all
 	install -d $(DESTDIR)/etc/default
 	echo "Consider running: sudo systemctl daemon-reload"
 	echo ""
+	@DESTDIR="$(DESTDIR)" sh scripts/install-user.sh
 	@DESTDIR="$(DESTDIR)" sh scripts/install-config.sh
 
 # Development target: run irrigationd in foreground

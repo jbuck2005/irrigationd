@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <poll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -144,8 +145,21 @@ int main(int argc, char *argv[]) {
         }
         if (SSL_connect(conn.ssl) != 1) {
             ERR_clear_error();
-            fprintf(stderr, "TLS handshake failed: the token is wrong, the server isn't irrigationd, "
-                            "or irrigationd is too old for TLS (IRRIGATION_PLAIN=1 sends it in plain text)\n");
+            // A busy irrigationd answers in plain text before reading the
+            // handshake. TLS took the first few bytes; the rest says why.
+            char left[64] = {0};
+            struct pollfd pfd = { .fd = sockfd, .events = POLLIN };
+            if (poll(&pfd, 1, 300) == 1) {
+                (void)!recv(sockfd, left, sizeof(left) - 1, MSG_DONTWAIT);
+            }
+            if (strstr(left, "busy")) {
+                fprintf(stderr, "irrigationd is busy: too many connections are open. Try again shortly\n");
+            } else if (strstr(left, "limit exceeded")) {
+                fprintf(stderr, "irrigationd refused the connection: too many failed logins from this address\n");
+            } else {
+                fprintf(stderr, "TLS handshake failed: the token is wrong, the server isn't irrigationd, "
+                                "or irrigationd is too old for TLS (IRRIGATION_PLAIN=1 sends it in plain text)\n");
+            }
             SSL_free(conn.ssl);
             close(sockfd);
             exit(EXIT_FAILURE);

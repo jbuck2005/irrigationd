@@ -1,0 +1,21 @@
+# Changelog
+
+## Unreleased
+
+### Security
+
+- Slow or idle connections can no longer lock Home Assistant out. Each connection gets 5 seconds to finish, one address can hold at most 4 connections, and one slot is always kept for the trusted address
+- The last 4 connection slots are kept for `IRRIGATIOND_TRUSTED_ADDR` and for any address that used the token in the last 15 minutes, so devices without the token can't shut Home Assistant out even when `IRRIGATIOND_TRUSTED_ADDR` isn't set
+- Refused connections are logged at most 10 every 10 seconds, with a count of the rest, so a flood can't wear the SD card or push the daemon's own messages out of the journal
+- `irrigationctl` refuses a server that offers a certificate instead of the token's key, so it can't be fooled by an impostor. It also warns when the token is given on the command line; set `IRRIGATION_TOKEN` instead
+- The systemd service is more tightly sandboxed: a read-only system, no capabilities, only the I2C device, and a limited set of system calls
+
+### Valve safety
+
+- SIGHUP and SIGQUIT now close every valve before the daemon exits, like SIGTERM. Before, they ended it with a valve open
+- A valve that fails to close when the daemon is stopped is retried every half second for up to 30 seconds, since systemd doesn't restart a stopped service
+
+### Other
+
+- `make install` creates the `irrigation` system user the service runs as and adds it to the `i2c` group, and sets an existing config file to mode 600
+- `irrigationctl` says when irrigationd is busy or rate limiting, instead of reporting a wrong token
