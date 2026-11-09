@@ -458,6 +458,12 @@ def test_long_line_is_refused():
         daemon.stop()
 
 
+def test_short_token_warning():
+    warning = "IRRIGATIOND_TOKEN is shorter than 16 characters"
+    check("a short token is warned about", warning in startup_log(IRRIGATIOND_TOKEN="short-token"))
+    check("no warning for a long token", warning not in startup_log())
+
+
 test_tls_and_plain_allowed()
 test_plain_disabled()
 test_token_never_sent()
@@ -471,6 +477,7 @@ test_every_stop_signal_closes_the_valves()
 test_failed_close_at_shutdown_is_retried()
 test_trusted_addr_reminder()
 test_long_line_is_refused()
+test_short_token_warning()
 
 print()
 if failures:

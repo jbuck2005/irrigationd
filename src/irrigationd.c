@@ -46,6 +46,7 @@
 #define SERVER_PORT     4242                                                       // TCP port to listen on
 #endif
 #define CMD_BUF_SZ      256                                                        // Max command length in bytes
+#define MIN_TOKEN_LEN   16                                                         // Shorter tokens are warned about, as in Home Assistant
 #define STATUS_BUF_SZ   (32 + 16 * MAX_ZONE)                                       // Header, plus up to 16 bytes per zone
 #define MAX_CLIENTS     16                                                         // Max concurrent client connections
 #define MAX_CLIENTS_PER_IP 4                                                       // Max concurrent connections from one address
@@ -977,6 +978,13 @@ int main(void) {
         fprintf(stderr, "IRRIGATIOND_TOKEN is still an example value, refusing to start. "
                         "Set your own in /etc/default/irrigationd: openssl rand -hex 16\n");
         exit(EXIT_FAILURE);
+    }
+
+    // A short token can be guessed offline from one recorded TLS handshake
+    if (strlen(g_auth_token) < MIN_TOKEN_LEN) {
+        fprintf(stderr, "WARNING: IRRIGATIOND_TOKEN is shorter than %d characters, so it could be guessed. "
+                        "Set a new one in /etc/default/irrigationd (openssl rand -hex 16), "
+                        "then in Home Assistant\n", MIN_TOKEN_LEN);
     }
 
     g_tls_ctx = tls_server_ctx(g_auth_token);
