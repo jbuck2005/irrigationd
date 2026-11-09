@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `make install` runs `systemctl daemon-reload` itself, so systemd picks up an updated unit file
 - The watchdog checks the MCP23017 every 30 seconds and sets it up again if it was reset or its latches changed. Before, a reset was only noticed at the next valve write, which could be hours away, with every pin an input in the meantime
 - Correction to 1.0.0: the reserved connection slots keep Home Assistant in only once it has used the token in the last 15 minutes. Right after irrigationd starts, a flood from devices without the token can keep it out until `IRRIGATIOND_TRUSTED_ADDR` is set. irrigationd now logs a reminder at startup, and `make install` prints one, while it isn't set and irrigationd listens beyond this machine
 - SIGHUP and SIGQUIT still close every valve, but now exit with a failure, so systemd starts the daemon again. Before, `kill -HUP` (often sent to reload a daemon) left the service stopped until someone noticed

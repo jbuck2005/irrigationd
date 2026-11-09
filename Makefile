@@ -56,10 +56,10 @@ install: all
 	install -d $(DESTDIR)/etc/systemd/system
 	install -m 644 $(SYSTEMD_DIR)/irrigationd.service $(DESTDIR)/etc/systemd/system/
 	install -d $(DESTDIR)/etc/default
-	echo "Consider running: sudo systemctl daemon-reload"
-	echo ""
 	@DESTDIR="$(DESTDIR)" sh scripts/install-user.sh
 	@DESTDIR="$(DESTDIR)" sh scripts/install-config.sh
+	@# Let systemd see the new unit file; skipped for a staging install or without systemd
+	@if [ -z "$(DESTDIR)" ] && [ -d /run/systemd/system ]; then systemctl daemon-reload && echo "Reloaded systemd units"; fi
 
 # Development target: run irrigationd in foreground
 dev: $(BIN_DIR)/irrigationd
