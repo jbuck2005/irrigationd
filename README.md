@@ -235,7 +235,13 @@ the token in plain text.
 
 - Always configure a strong `IRRIGATIOND_TOKEN`.
 - Keep `IRRIGATIOND_BIND_ADDR=127.0.0.1` unless you explicitly need remote access.
-- Use a firewall if exposing the service beyond localhost.
+- Use a firewall if exposing the service beyond localhost. The systemd unit can
+  also do this for you: run `sudo systemctl edit irrigationd`, add
+  `[Service]`, `IPAddressDeny=any` and `IPAddressAllow=localhost <Home Assistant
+  address>`, then restart. Only those addresses can connect, whatever the firewall says.
+- The unit runs the daemon in a tight sandbox: no capabilities, a read-only
+  system, only the I2C bus from `/dev`, and only the system calls a normal
+  service needs. If you move the MCP23017 to another bus, update `DeviceAllow=`.
 - Set `IRRIGATIOND_PLAIN_TOKEN=no` once every client uses TLS.
 - Home Assistant integration must be configured with the same token.
 - After 10 connections from one IP fail to authenticate within 60 seconds, each
