@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.0 - 2026-11-09
+
 ### Security
 
 - Slow or idle connections can no longer lock Home Assistant out. Each connection gets 5 seconds to finish, one address can hold at most 4 connections, and one slot is always kept for the trusted address
