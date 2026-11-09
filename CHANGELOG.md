@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- SIGHUP and SIGQUIT still close every valve, but now exit with a failure, so systemd starts the daemon again. Before, `kill -HUP` (often sent to reload a daemon) left the service stopped until someone noticed
+
 ## 1.0.0 - 2026-11-09
 
 ### Security
