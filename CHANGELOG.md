@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.1 - 2026-11-09
+
 - A command line too long for the 255-byte buffer is refused with `ERR command too long`. Before, it was cut short and the rest acted on, and a cut can change a command's meaning, such as `TIME=3600` read as `TIME=3`
 - irrigationd logs a warning at startup when `IRRIGATIOND_TOKEN` is shorter than 16 characters, the minimum Home Assistant accepts for a new token. A short token could be guessed offline from one recorded TLS handshake. It still starts, so an existing install keeps watering
 - `make install` runs `systemctl daemon-reload` itself, so systemd picks up an updated unit file
