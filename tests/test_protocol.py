@@ -458,6 +458,23 @@ def test_long_line_is_refused():
         daemon.stop()
 
 
+def test_nul_byte_is_refused():
+    daemon = Daemon()
+    try:
+        # Read as a C string, this would end at the NUL and run for 3 seconds
+        reply = plain_line(f"ZONE=2 TOKEN={TOKEN} TIME=3\x00600")
+        check("a command with a NUL byte is refused", reply == "ERR invalid character", reply)
+        if hasattr(ssl.SSLContext, "set_psk_client_callback"):
+            reply, _, _ = python_tls("ZONE=2 TIME=3\x00600", TOKEN)
+            check("a command with a NUL byte is refused over TLS", reply == "ERR invalid character", reply)
+        else:
+            print("SKIP Python ssl NUL check: needs Python 3.13 or later")
+        status = plain_line(f"STATUS TOKEN={TOKEN}")
+        check("the NUL command opened nothing", " Z2=OFF:0" in status, status)
+    finally:
+        daemon.stop()
+
+
 def test_short_token_warning():
     warning = "IRRIGATIOND_TOKEN is shorter than 16 characters"
     check("a short token is warned about", warning in startup_log(IRRIGATIOND_TOKEN="short-token"))
@@ -477,6 +494,7 @@ test_every_stop_signal_closes_the_valves()
 test_failed_close_at_shutdown_is_retried()
 test_trusted_addr_reminder()
 test_long_line_is_refused()
+test_nul_byte_is_refused()
 test_short_token_warning()
 
 print()
