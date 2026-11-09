@@ -11,6 +11,7 @@ Usage: test_protocol.py IRRIGATIOND IRRIGATIONCTL PORT
 
 import hashlib
 import os
+import signal
 import socket
 import ssl
 import subprocess
@@ -317,12 +318,51 @@ def test_token_on_command_line_warns():
     finally:
         daemon.stop()
 
+def stop_with(daemon, sig):
+    daemon.proc.send_signal(sig)
+    try:
+        return daemon.proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        daemon.proc.kill()
+        return None
+
+
+def test_every_stop_signal_closes_the_valves():
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGQUIT):
+        daemon = Daemon()
+        try:
+            rc, out, err = ctl("ZONE=1 TIME=600", token=TOKEN)
+            code = stop_with(daemon, sig)
+            log = daemon.output()
+        finally:
+            daemon.stop()
+        check(f"{sig.name} closes an open valve before exiting",
+              rc == 0 and code == 0 and "fake valve: zone 1 OFF" in log.split("Received signal")[-1],
+              f"rc={rc} exit={code}\n{log}")
+
+
+def test_failed_close_at_shutdown_is_retried():
+    daemon = Daemon(FAKE_FAILED_CLOSES="3")
+    try:
+        ctl("ZONE=1 TIME=600", token=TOKEN)
+        code = stop_with(daemon, signal.SIGTERM)
+        log = daemon.output()
+    finally:
+        daemon.stop()
+    after = log.split("Received signal")[-1]
+    check("a close that fails at shutdown is retried until it works",
+          code == 0 and after.count("close failed") == 3 and "zone 1 OFF" in after
+          and "closed on retry" in after, f"exit={code}\n{log}")
+
+
 test_tls_and_plain_allowed()
 test_plain_disabled()
 test_token_never_sent()
 test_slow_clients_cant_lock_out_the_trusted_host()
 test_impostor_with_a_certificate_is_refused()
 test_token_on_command_line_warns()
+test_every_stop_signal_closes_the_valves()
+test_failed_close_at_shutdown_is_retried()
 
 print()
 if failures:
