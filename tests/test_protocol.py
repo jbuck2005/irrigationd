@@ -464,8 +464,11 @@ def test_nul_byte_is_refused():
         # Read as a C string, this would end at the NUL and run for 3 seconds
         reply = plain_line(f"ZONE=2 TOKEN={TOKEN} TIME=3\x00600")
         check("a command with a NUL byte is refused", reply == "ERR invalid character", reply)
-        reply, _, _ = python_tls("ZONE=2 TIME=3\x00600", TOKEN)
-        check("a command with a NUL byte is refused over TLS", reply == "ERR invalid character", reply)
+        if hasattr(ssl.SSLContext, "set_psk_client_callback"):
+            reply, _, _ = python_tls("ZONE=2 TIME=3\x00600", TOKEN)
+            check("a command with a NUL byte is refused over TLS", reply == "ERR invalid character", reply)
+        else:
+            print("SKIP Python ssl NUL check: needs Python 3.13 or later")
         status = plain_line(f"STATUS TOKEN={TOKEN}")
         check("the NUL command opened nothing", " Z2=OFF:0" in status, status)
     finally:
