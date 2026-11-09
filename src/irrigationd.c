@@ -55,6 +55,8 @@
 #define ZONE_COOLDOWN_SECS 600                                                     // Wait after a valve reaches MAX_ZONE_RUNTIME
 #define ZONE_AT_LIMIT   1                                                          // start_zone: no time left, or still cooling down
 #define CLOSE_RETRY_MS  1000                                                       // Retry interval when a valve fails to close
+#define SHUTDOWN_CLOSE_RETRY_MS 500                                                // On a stop signal, retry a failed close this often
+#define SHUTDOWN_CLOSE_RETRIES  60                                                 // ...for up to 30 seconds
 
 // FIX: Rate Limiting Configuration
 #define MAX_TRACKED_IPS   256                                                      // Max IPs to track for rate limiting
@@ -777,13 +779,35 @@ static void *signal_thread(void *arg) {
 
     // Keep the lock until exit, so no command can open a valve after this
     pthread_mutex_lock(&zone_lock);
-    int failed = 0;
+    int failed[MAX_ZONE + 1] = {0};
+    int any_failed = 0;
     for (int z = 1; z <= MAX_ZONE; z++) {
-        failed |= stop_zone(z);
+        failed[z] = stop_zone(z) != 0;
+        any_failed |= failed[z];
+    }
+
+    // systemd doesn't restart a stopped service, so a failed close is retried
+    // here rather than left to a restart that may never come
+    for (int attempt = 0; any_failed && attempt < SHUTDOWN_CLOSE_RETRIES; attempt++) {
+        struct timespec pause = { 0, SHUTDOWN_CLOSE_RETRY_MS * 1000000L };
+        nanosleep(&pause, NULL);
+        any_failed = 0;
+        for (int z = 1; z <= MAX_ZONE; z++) {
+            if (failed[z]) {
+                failed[z] = stop_zone(z) != 0;
+                if (!failed[z]) {
+                    fprintf(stderr, "Zone %d: closed on retry\n", z);
+                }
+                any_failed |= failed[z];
+            }
+        }
+    }
+    if (any_failed) {
+        fprintf(stderr, "Some zones could not be closed before exiting\n");
     }
 
     // A failure exit lets systemd restart us, and startup closes all zones again
-    exit(failed ? EXIT_FAILURE : EXIT_SUCCESS);
+    exit(any_failed ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
 // Example values from the docs and older default configs. They are public, so
@@ -845,6 +869,9 @@ int main(void) {
     sigemptyset(&stop_signals);
     sigaddset(&stop_signals, SIGTERM);
     sigaddset(&stop_signals, SIGINT);
+    // These would otherwise end the daemon without closing any valve
+    sigaddset(&stop_signals, SIGHUP);
+    sigaddset(&stop_signals, SIGQUIT);
     pthread_sigmask(SIG_BLOCK, &stop_signals, NULL);
     signal(SIGPIPE, SIG_IGN);                                                      // A client hanging up must not kill us
 
