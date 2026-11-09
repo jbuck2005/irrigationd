@@ -585,7 +585,13 @@ struct client_arg {
 static void handle_line(struct conn *conn, const char *addrbuf, int over_limit, int *authenticated) {
     char buf[CMD_BUF_SZ];
     ssize_t n = read_line(conn, buf, sizeof(buf));
-    if (n > 0) {
+    if (n == (ssize_t)sizeof(buf) - 1) {
+        // A line that fills the buffer was cut short, and a cut can change its
+        // meaning, such as TIME=3600 read as TIME=3, so refuse it whole
+        const char err[] = "ERR command too long\n";
+        conn_write(conn, err, sizeof(err) - 1);
+        fprintf(stderr, "[%s] Rejected command (too long)\n", addrbuf);
+    } else if (n > 0) {
         parse_command(conn, buf, addrbuf, over_limit, authenticated);
     } else if (n < 0) {
         fprintf(stderr, "[%s] read from client failed: %s\n", addrbuf, strerror(errno));

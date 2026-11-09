@@ -443,6 +443,21 @@ def test_trusted_addr_reminder():
           reminder not in startup_log(IRRIGATIOND_BIND_ADDR=HOST))
 
 
+def test_long_line_is_refused():
+    daemon = Daemon()
+    try:
+        # Cut at 255 bytes, this would read as TIME=3
+        line = f"ZONE=2 TOKEN={TOKEN} " + "x" * (255 - len(f"ZONE=2 TOKEN={TOKEN} ") - 7) + " TIME=3600"
+        reply = plain_line(line)
+        check("a command too long for the buffer is refused", reply == "ERR command too long", reply)
+        status = plain_line(f"STATUS TOKEN={TOKEN}")
+        check("the cut command opened nothing", " Z2=OFF:0" in status, status)
+        reply = plain_line(f"ZONE=2 TIME=0 TOKEN={TOKEN}")
+        check("a normal command still works", reply == "OK", reply)
+    finally:
+        daemon.stop()
+
+
 test_tls_and_plain_allowed()
 test_plain_disabled()
 test_token_never_sent()
@@ -455,6 +470,7 @@ test_token_on_command_line_warns()
 test_every_stop_signal_closes_the_valves()
 test_failed_close_at_shutdown_is_retried()
 test_trusted_addr_reminder()
+test_long_line_is_refused()
 
 print()
 if failures:
