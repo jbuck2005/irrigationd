@@ -37,6 +37,12 @@ int mcp_set_zone_state(int zone, int state) {
     return 0;
 }
 
+int mcp_check_chip(void) {
+    static int checks = 0;
+    if (++checks == 1) fprintf(stderr, "fake valve: chip checked\n");
+    return 0;
+}
+
 int mcp_get_zone_state(int zone) {
     return (zone < 1 || zone > MAX_ZONE) ? -1 : fake_state[zone];
 }

@@ -36,6 +36,11 @@ int mcp_config_outputs(void);
 // Read irrigation zone state (1 = ON, 0 = OFF)                                //
 int mcp_get_zone_state(int zone);
 
+// Checks that the chip still has every pin as an output and the latches the
+// driver last wrote, and writes them again if not, such as after the chip
+// reset. Returns 1 if it had to, 0 if all was well, -1 if the bus failed.
+int mcp_check_chip(void);
+
 // Number of supported zones (GPIO pins)                                       //
 #define MAX_ZONE 14
 
