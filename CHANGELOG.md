@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- GitHub Actions checks every pull request and push to `main`: builds with gcc and clang on x64 and arm64 with warnings as errors, the protocol tests (also under AddressSanitizer and UBSan, and on Debian bookworm), cppcheck, shellcheck and CodeQL. A release tag fails unless this file has a matching `## X.Y.Z - YYYY-MM-DD` heading
+- The README documents the protocol and every reply, the valve safety checks, the make targets, the hardware wiring, what `make install` does, and CI. It also says to restart the daemon after `make install`, which doesn't do it
+- `irrigationctl` with no command lists the commands, and `IRRIGATION_HOST`, `IRRIGATION_PORT` and `IRRIGATION_PLAIN`
+- Correction to 1.0.1: `make install` prints the `IRRIGATIOND_TRUSTED_ADDR` reminder whenever it isn't set, whatever the bind address. Only the daemon's reminder depends on the bind address
+
 ## 1.0.2 - 2026-11-09
 
 - A command with a NUL byte in it is refused with `ERR invalid character`. Before, everything after the NUL was ignored, which can change a command's meaning, such as `TIME=3<NUL>600` read as `TIME=3`
