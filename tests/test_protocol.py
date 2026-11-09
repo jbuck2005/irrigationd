@@ -403,8 +403,10 @@ def test_every_stop_signal_closes_the_valves():
             log = daemon.output()
         finally:
             daemon.stop()
-        check(f"{sig.name} closes an open valve before exiting",
-              rc == 0 and code == 0 and "fake valve: zone 1 OFF" in log.split("Received signal")[-1],
+        # SIGHUP and SIGQUIT exit with a failure, so systemd starts the daemon again
+        want = 0 if sig in (signal.SIGTERM, signal.SIGINT) else 1
+        check(f"{sig.name} closes an open valve before exiting with {want}",
+              rc == 0 and code == want and "fake valve: zone 1 OFF" in log.split("Received signal")[-1],
               f"rc={rc} exit={code}\n{log}")
 
 

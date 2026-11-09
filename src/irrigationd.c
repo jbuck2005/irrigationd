@@ -878,8 +878,11 @@ static void *signal_thread(void *arg) {
         fprintf(stderr, "Some zones could not be closed before exiting\n");
     }
 
-    // A failure exit lets systemd restart us, and startup closes all zones again
-    exit(any_failed ? EXIT_FAILURE : EXIT_SUCCESS);
+    // A failure exit lets systemd restart us, and startup closes all zones again.
+    // SIGHUP and SIGQUIT also exit with a failure: no one meant to stop the
+    // service, such as "kill -HUP" sent for a reload, so it should come back.
+    int stop_requested = sig == SIGTERM || sig == SIGINT;
+    exit(any_failed || !stop_requested ? EXIT_FAILURE : EXIT_SUCCESS);
 }
 
 // Example values from the docs and older default configs. They are public, so
