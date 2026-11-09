@@ -14,6 +14,7 @@
 
 - SIGHUP and SIGQUIT now close every valve before the daemon exits, like SIGTERM. Before, they ended it with a valve open
 - A valve that fails to close when the daemon is stopped is retried every half second for up to 30 seconds, since systemd doesn't restart a stopped service
+- If the MCP23017 resets, such as on a brown-out when a solenoid starts, it's set up again before the next valve write, and each write is read back so a write the chip didn't take counts as failed and a close is retried
 
 ### Other
 
