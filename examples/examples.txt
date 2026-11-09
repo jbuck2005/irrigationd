@@ -1,4 +1,4 @@
-# Run zone 1 for 120 seconds
+# Run zone 1 for 120 seconds, with the token in IRRIGATION_TOKEN
+# (and IRRIGATION_HOST set if irrigationd is on another machine)
 
-netcat 10.0.0.xx
-"ZONE=1 TIME=120"
+irrigationctl "ZONE=1 TIME=120"
